@@ -22,6 +22,28 @@ VidMo Studio is designed as a **local-first** tool:
 - AI planner requests (when enabled) go only to the `OPENAI_BASE_URL` you
   configure, using the API key you provide. Keys are read from environment
   variables and are never written to the data store or returned by the API.
+- Google Flow automation uses the optional `playwright-core` driver to attach
+  to a visible Chrome/Edge window with a dedicated local profile
+  (`data/flow-profile`). VidMo never asks for, proxies or stores Google
+  credentials, cookies or session tokens; the sign-in happens directly on
+  Google's page and the session stays in the local browser profile. Flow
+  diagnostics (screenshots, DOM/ARIA snapshots and body-text previews) are
+  written under `data/flow/diagnostics/` on this machine and are not uploaded.
+  Generated media, uploads and assets are stored under `data/media/`; the media
+  endpoint only serves files registered to a project's assets, with Range
+  support.
+
+## Flow-specific notes
+
+- Only run Flow automation against **your own** Google account, and only where
+  it complies with Google's Terms of Service for the Flow web app.
+- The selector map (`src/server/flow/selectors.js`, override
+  `data/flow/selectors.json`) is user-auditable plain text. VidMo stops and
+  waits for you on captchas, credit limits, terms prompts or unexpected UI — it
+  does not bypass them.
+- Treat `data/` as sensitive: it can contain Flow project names, screenshots of
+  your signed-in Flow session and generated media. Add it to backups or
+  deletion policies accordingly (it is gitignored by default).
 
 ## Reporting a vulnerability
 

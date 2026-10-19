@@ -40,6 +40,7 @@ const state = {
   project: null,
   ai: null,
   render: null,
+  flow: null,
   settings: null,
   routeSection: null,
   ideasFilter: 'all',
@@ -51,6 +52,14 @@ const state = {
   expanded: {},
   modal: null,
   busy: false,
+  flowConsent: Boolean(readJson('vidmo.flowConsent', false)),
+  flowDiagnostics: null,
+  flowSignature: null,
+  flowTimer: null,
+  generationTimer: null,
+  lastGenerationStatus: null,
+  lastGenerationCount: -1,
+  polling: false,
 };
 
 function esc(value) {
@@ -97,6 +106,108 @@ function shortDate(iso) {
 
 function plural(count, singular, pluralForm = `${singular}s`) {
   return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+function flowStatusLabel(flow = state.flow) {
+  if (!flow) return 'Flow: not connected';
+  if (flow.mode === 'stub' && flow.status === 'ready') return 'Flow: simulator';
+  const labels = {
+    ready: 'Flow: connected',
+    busy: 'Flow: generating',
+    launching: 'Flow: opening',
+    awaiting_login: 'Flow: sign in',
+    attention: 'Flow: needs you',
+    paused: 'Flow: paused',
+    error: 'Flow: error',
+    disconnected: 'Flow: not connected',
+  };
+  return labels[flow.status] ?? 'Flow: not connected';
+}
+
+function isFlowConnected() {
+  const flow = state.flow;
+  if (!flow) return false;
+  if (flow.mode === 'stub') return true;
+  return flow.status === 'ready' || flow.status === 'busy';
+}
+
+function isGenerationActive(generation = state.project?.generation) {
+  return Boolean(
+    generation && ['queued', 'running', 'attention', 'cancelling'].includes(generation.status),
+  );
+}
+
+function generationSummary(generation = state.project?.generation) {
+  const stages = state.project?.storyboard?.stages ?? [];
+  const stageMap = generation?.stages ?? {};
+  const summary = { images: 0, clips: 0, approvedImages: 0, approvedClips: 0 };
+  for (const stage of stages) {
+    const stageState = stageMap[stage.id];
+    summary.images += stageState?.images?.length ?? 0;
+    summary.clips += stageState?.clips?.length ?? 0;
+    if (stageState?.approvedImageId) summary.approvedImages += 1;
+    if (stageState?.approvedClipId) summary.approvedClips += 1;
+  }
+  return summary;
+}
+
+function stageGeneration(stageId) {
+  return state.project?.generation?.stages?.[stageId] ?? null;
+}
+
+function assetById(stageId, assetId) {
+  const generation = stageGeneration(stageId);
+  if (!generation) return null;
+  return (
+    [...(generation.images ?? []), ...(generation.clips ?? [])].find(
+      (asset) => asset.id === assetId,
+    ) ?? null
+  );
+}
+
+function selectedImage(stageId) {
+  const generation = stageGeneration(stageId);
+  if (!generation) return null;
+  return (
+    generation.images?.find((asset) => asset.id === generation.approvedImageId) ??
+    generation.images?.find((asset) => asset.approved) ??
+    generation.images?.at(-1) ??
+    null
+  );
+}
+
+function selectedClip(stageId) {
+  const generation = stageGeneration(stageId);
+  if (!generation) return null;
+  return (
+    generation.clips?.find((asset) => asset.id === generation.approvedClipId) ??
+    generation.clips?.find((asset) => asset.approved) ??
+    generation.clips?.at(-1) ??
+    null
+  );
+}
+
+function mediaUrl(projectId, stageId, file, { download = false } = {}) {
+  if (!file) return '';
+  return `/api/projects/${encodeURIComponent(projectId)}/media/${encodeURIComponent(
+    stageId,
+  )}/${encodeURIComponent(file)}${download ? '?download=1' : ''}`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function assetAge(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
 }
 
 async function api(path, { method = 'GET', body } = {}) {
@@ -298,6 +409,7 @@ function renderLibrary() {
 function renderStatusChips() {
   const ai = state.ai;
   const render = state.render;
+  const flow = state.flow;
   const aiChip = $('#aiChip');
   aiChip.classList.toggle('is-off', !ai?.configured);
   $('.status-label', aiChip).textContent = ai?.configured
@@ -308,6 +420,14 @@ function renderStatusChips() {
   $('.status-label', renderChip).textContent = render?.configured
     ? 'Render bridge: connected'
     : 'Render: pack export mode';
+  const flowChip = $('#flowChip');
+  if (flowChip) {
+    const attention = ['attention', 'awaiting_login', 'error'].includes(flow?.status);
+    flowChip.classList.toggle('is-off', !isFlowConnected());
+    flowChip.classList.toggle('is-attention', attention);
+    flowChip.classList.toggle('is-busy', flow?.status === 'busy');
+    $('.status-label', flowChip).textContent = flowStatusLabel(flow);
+  }
 }
 
 function renderCrumbs() {
@@ -337,15 +457,18 @@ function renderTopbarActions() {
     <span class="chip chip-muted">${plural(project.storyboard.totalStages, 'shot')} · ${runtime(
       project.storyboard.totalDuration,
     )}</span>
+    <button class="btn btn-ghost btn-sm" type="button" data-action="open-flow">${esc(
+      flowStatusLabel(),
+    )}</button>
     <button class="btn btn-ghost btn-sm" type="button" data-action="goto-step" data-step="production">Production pack</button>
     <a class="btn btn-outline btn-sm" href="/api/projects/${esc(project.id)}/export?format=zip">Export ZIP</a>`;
 }
 
-function renderView(html) {
+function renderView(html, { focus = true, scroll = true } = {}) {
   const view = $('#view');
   view.innerHTML = `<div class="view-enter">${html}</div>`;
-  view.focus({ preventScroll: true });
-  window.scrollTo({ top: 0, behavior: 'auto' });
+  if (focus) view.focus({ preventScroll: true });
+  if (scroll) window.scrollTo({ top: 0, behavior: 'auto' });
 }
 
 function renderSkeleton() {
@@ -395,8 +518,10 @@ async function route() {
   if (parsed.name === 'new') {
     state.project = null;
     state.routeSection = 'audience';
+    stopGenerationPolling();
     renderShell();
     renderAudienceView();
+    syncFlowPolling();
     return;
   }
 
@@ -427,6 +552,14 @@ async function route() {
   else if (section === 'storyboard') renderStoryboardView();
   else if (section === 'production') renderProductionView();
   else renderAudienceView();
+
+  const generation = state.project?.generation;
+  state.lastGenerationStatus = generation?.status ?? null;
+  state.lastGenerationCount =
+    (generation?.summary?.images ?? 0) + (generation?.summary?.clips ?? 0);
+  if (isGenerationActive(generation)) startGenerationPolling();
+  else stopGenerationPolling();
+  syncFlowPolling();
 }
 
 /* ==========================================================================
@@ -893,16 +1026,279 @@ function promptBlock(stage, index, kind) {
     </div>`;
 }
 
+function flowPanelHtml(project) {
+  const flow = state.flow;
+  const generation = project.generation;
+  const stages = project.storyboard.stages;
+  const summary = generationSummary(generation);
+  const active = isGenerationActive(generation);
+  const connected = isFlowConnected();
+  const allApproved =
+    stages.length > 0 && stages.every((stage) => Boolean(stageGeneration(stage.id)?.approvedImageId));
+  const total = generation?.total ?? stages.length;
+  const done = (generation?.completed ?? 0) + (generation?.failed ?? 0);
+  const progress = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const tone =
+    flow?.status === 'attention' || flow?.status === 'error' || flow?.status === 'awaiting_login'
+      ? 'is-attention'
+      : isFlowConnected()
+        ? 'is-ready'
+        : 'is-off';
+  const modeLabel =
+    flow?.mode === 'stub'
+      ? 'Simulator'
+      : flow?.configured
+        ? flow?.browser || 'Visible Chrome'
+        : 'Setup required';
+  const canStart = connected && !active;
+
+  if (!flow) {
+    return `<article class="card flow-panel is-off" id="flowPanel">
+      <div class="flow-head">
+        <div class="flow-title"><span class="flow-orb"></span><div><h3>Google Flow generation</h3><p>Flow status is unavailable. Reload the studio.</p></div></div>
+      </div>
+    </article>`;
+  }
+
+  return `
+    <article class="card flow-panel ${tone}" id="flowPanel">
+      <div class="flow-head">
+        <div class="flow-title">
+          <span class="flow-orb"></span>
+          <div>
+            <h3>Google Flow generation</h3>
+            <p>${esc(flow.message || 'Connect your own Flow account to generate stage images and clips.')}</p>
+          </div>
+        </div>
+        <div class="flow-head-actions">
+          <span class="flow-mode">${esc(modeLabel)}</span>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="open-flow">Flow settings</button>
+        </div>
+      </div>
+
+      <div class="flow-stats">
+        <div class="flow-stat"><small>Stage images</small><strong>${summary.images}</strong><span>${summary.approvedImages}/${stages.length} approved</span></div>
+        <div class="flow-stat"><small>Video clips</small><strong>${summary.clips}</strong><span>${summary.approvedClips}/${stages.length} approved</span></div>
+        <div class="flow-stat"><small>Flow credits</small><strong>${flow.mode === 'stub' ? '—' : 'Your account'}</strong><span>VidMo never sees the balance</span></div>
+      </div>
+
+      ${
+        flow.mode === 'stub'
+          ? `<div class="flow-banner"><span>◈</span><div><strong>Simulator mode</strong><p>These are placeholder files, not real Flow generations. Set <span class="mono">VIDMO_FLOW_MODE</span> to <span class="mono">browser</span> to use your account.</p></div></div>`
+          : !flow.configured
+            ? `<div class="flow-banner is-warning"><span>!</span><div><strong>Optional browser driver missing</strong><p>${esc(flow.installNote || 'Run npm install playwright-core, then reconnect.')}</p></div></div>`
+            : flow.status === 'attention'
+              ? `<div class="flow-banner is-warning"><span>!</span><div><strong>Flow needs you</strong><p>${esc(flow.attention || flow.message)}</p><div class="flow-inline-actions"><button class="btn btn-primary btn-sm" type="button" data-action="resume-flow">Resume</button><button class="btn btn-ghost btn-sm" type="button" data-action="focus-flow">Open Flow window</button></div></div></div>`
+              : ''
+      }
+
+      ${
+        generation
+          ? `<div class="flow-progress" role="status" aria-live="polite">
+              <div class="flow-progress-top">
+                <span>${esc(generation.message || 'Ready')}</span>
+                <strong>${done}/${total}</strong>
+              </div>
+              <div class="flow-track"><span class="flow-bar" style="width:${progress}%"></span></div>
+              <div class="flow-progress-foot">
+                <span>${esc(
+                  generation.status === 'queued'
+                    ? 'Queued'
+                    : generation.status === 'running'
+                      ? 'Flow handles one shot at a time'
+                      : generation.status === 'attention'
+                        ? 'Waiting for you'
+                        : generation.status === 'cancelling'
+                          ? 'Cancelling'
+                          : `${generation.status}${generation.finishedAt ? ` · ${assetAge(generation.finishedAt)}` : ''}`,
+                )}</span>
+                ${active ? '<button class="btn btn-ghost btn-sm" type="button" data-action="cancel-generation">Cancel</button>' : ''}
+              </div>
+            </div>`
+          : ''
+      }
+
+      ${
+        generation?.errors?.length
+          ? `<div class="flow-errors">${generation.errors
+              .slice(0, 3)
+              .map((error) => `<span>${esc(error.stageId ? `${error.stageId}: ` : '')}${esc(error.message)}</span>`)
+              .join('')}</div>`
+          : ''
+      }
+
+      <div class="flow-stage-map">
+        ${stages
+          .map((stage, index) => {
+            const stageState = stageGeneration(stage.id);
+            const hasImage = Boolean(stageState?.images?.length);
+            const approved = Boolean(stageState?.approvedImageId);
+            const hasClip = Boolean(stageState?.clips?.length);
+            const stateClass = approved ? 'is-approved' : hasImage ? 'is-draft' : '';
+            return `<button class="flow-stage-pill ${stateClass}" type="button" data-action="scroll-stage" data-stage="${index}">
+              <span>${esc(stage.id)}</span>
+              <small>${hasImage ? (approved ? 'image ✓' : 'image') : 'image —'}${hasClip ? ' · clip' : ''}</small>
+            </button>`;
+          })
+          .join('')}
+      </div>
+
+      <div class="flow-actions">
+        ${
+          !connected
+            ? `<button class="btn btn-primary btn-sm" type="button" data-action="open-flow">Connect Google Flow</button>`
+            : `<button class="btn btn-primary btn-sm" type="button" data-action="generate-images" ${canStart ? '' : 'disabled'}>Generate all images</button>
+               <button class="btn btn-outline btn-sm" type="button" data-action="approve-images" ${canStart && summary.images > summary.approvedImages ? '' : 'disabled'}>Approve all current images</button>
+               <button class="btn btn-primary btn-sm" type="button" data-action="generate-clips" ${canStart && allApproved ? '' : 'disabled'} title="${allApproved ? 'Generate one clip per approved image' : 'Approve one image for every stage first'}">Generate all clips</button>`
+        }
+        <a class="btn btn-outline btn-sm" href="/api/projects/${esc(project.id)}/export?format=flow">Flow pack</a>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="focus-flow" ${flow.connected ? '' : 'disabled'}>Open Flow window</button>
+      </div>
+      <p class="flow-note">Images first, then image-to-video. Flow generation uses your own Flow credits. VidMo never stores your Google password, cookies or session tokens. <a href="https://labs.google/fx/tools/flow" target="_blank" rel="noreferrer">Open Flow</a></p>
+    </article>`;
+}
+
+function assetHistoryHtml(stage, index, images, approvedId) {
+  if (!images || images.length < 2) return '';
+  return `<div class="asset-history">
+    <small>Earlier takes · click to approve</small>
+    <div class="asset-history-row">
+      ${images
+        .slice(0, -1)
+        .reverse()
+        .map(
+          (asset) => `<button class="asset-thumb ${asset.id === approvedId ? 'is-approved' : ''}" type="button"
+            data-action="approve-asset" data-stage="${index}" data-asset-id="${esc(asset.id)}"
+            title="Use this take as the approved stage image">
+            <img src="${mediaUrl(state.project.id, stage.id, asset.file)}" alt="Earlier stage image" loading="lazy" />
+            <span>${asset.id === approvedId ? '✓' : ''}</span>
+          </button>`,
+        )
+        .join('')}
+    </div>
+  </div>`;
+}
+
+function assetPanel(stage, index) {
+  const generation = stageGeneration(stage.id);
+  const images = generation?.images ?? [];
+  const clips = generation?.clips ?? [];
+  const image = selectedImage(stage.id);
+  const clip = selectedClip(stage.id);
+  const imageApproved = Boolean(
+    image && (image.id === generation?.approvedImageId || image.approved),
+  );
+  const connected = isFlowConnected();
+  const active = isGenerationActive();
+  const canGenerate = connected && !active;
+  const projectId = state.project.id;
+  const poster = image ? mediaUrl(projectId, stage.id, image.file) : '';
+  const clipReady = Boolean(generation?.approvedImageId);
+  const staleImage = image?.promptStale;
+  const staleClip = clip?.promptStale;
+  const imageSource = image?.source === 'simulator' ? 'Simulator' : image?.source === 'upload' ? 'Uploaded' : 'Flow';
+  const clipSource = clip?.source === 'simulator' ? 'Simulator' : clip?.source === 'upload' ? 'Uploaded' : 'Flow';
+
+  return `
+    <div class="asset-panel">
+      <div class="asset-head">
+        <div>
+          <span class="asset-eyebrow">Flow assets</span>
+          <strong>${images.length ? `${plural(images.length, 'image take')} · ` : ''}${clips.length ? `${plural(clips.length, 'clip')}` : 'No clips yet'}</strong>
+        </div>
+        <span class="asset-gate ${clipReady ? 'is-ready' : ''}">${clipReady ? '✓ image approved' : 'approve image to unlock video'}</span>
+      </div>
+
+      <div class="asset-grid">
+        <div class="asset-card">
+          <div class="asset-preview ${image ? 'has-media' : ''}">
+            ${
+              image
+                ? `<img src="${poster}" alt="${esc(stage.name)} stage image" loading="lazy" />`
+                : `<span class="asset-placeholder-icon">◉</span><span class="asset-placeholder-text">Stage image</span>`
+            }
+            <span class="asset-kind">IMAGE</span>
+            ${imageApproved ? '<span class="asset-approved">✓ approved</span>' : ''}
+            ${staleImage ? '<span class="asset-stale">prompt changed</span>' : ''}
+          </div>
+          <div class="asset-meta">
+            <div class="asset-meta-row">
+              <strong>${image ? 'Stage image' : 'No stage image yet'}</strong>
+              <small>${image ? `${esc(imageSource)}${image.model ? ` · ${esc(image.model)}` : ''}${image.bytes ? ` · ${formatBytes(image.bytes)}` : ''}${image.createdAt ? ` · ${assetAge(image.createdAt)}` : ''}` : 'Generate in Flow or upload a download.'}</small>
+            </div>
+            <div class="asset-actions">
+              ${
+                image
+                  ? `<button class="btn btn-primary btn-sm" type="button" data-action="approve-asset" data-stage="${index}" data-asset-id="${esc(image.id)}" ${imageApproved ? 'disabled' : ''}>${imageApproved ? 'Approved' : 'Approve image'}</button>`
+                  : ''
+              }
+              <button class="btn btn-outline btn-sm" type="button" data-action="generate-stage-image" data-stage="${index}" ${canGenerate ? '' : 'disabled'}>${image ? 'Reroll image' : 'Generate image'}</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-action="pick-asset" data-stage="${index}" data-kind="image">Upload</button>
+              ${image ? `<a class="btn btn-ghost btn-sm" href="${mediaUrl(projectId, stage.id, image.file, { download: true })}">Download</a><button class="btn btn-ghost btn-sm is-danger-text" type="button" data-action="delete-asset" data-stage="${index}" data-asset-id="${esc(image.id)}" data-kind="image">Remove</button>` : ''}
+            </div>
+            <input type="file" hidden data-action="import-file" data-stage="${index}" data-kind="image" accept="image/png,image/jpeg,image/webp" />
+          </div>
+          ${image && staleImage ? '<p class="asset-warning">The prompt changed after this take. Reroll to match the current storyboard.</p>' : ''}
+          ${assetHistoryHtml(stage, index, images, generation?.approvedImageId)}
+        </div>
+
+        <div class="asset-card">
+          <div class="asset-preview asset-video ${clip ? 'has-media' : ''}">
+            ${
+              clip?.stub
+                ? `<div class="asset-stub-video" ${poster ? `style="background-image:url('${poster}')"` : ''}><span>▶</span><small>Simulated clip</small></div>`
+                : clip
+                  ? `<video controls preload="metadata" ${poster ? `poster="${poster}"` : ''} src="${mediaUrl(projectId, stage.id, clip.file)}"></video>`
+                  : `<span class="asset-placeholder-icon">▶</span><span class="asset-placeholder-text">Image-to-video clip</span>`
+            }
+            <span class="asset-kind">CLIP</span>
+            ${clip ? '<span class="asset-approved">✓ ready</span>' : ''}
+            ${staleClip ? '<span class="asset-stale">prompt changed</span>' : ''}
+          </div>
+          <div class="asset-meta">
+            <div class="asset-meta-row">
+              <strong>${clip ? 'Generated clip' : 'No clip yet'}</strong>
+              <small>${clip ? `${esc(clipSource)}${clip.bytes ? ` · ${formatBytes(clip.bytes)}` : ''}${clip.createdAt ? ` · ${assetAge(clip.createdAt)}` : ''}` : clipReady ? 'The approved image is ready as the start frame.' : 'Approve a stage image first.'}</small>
+            </div>
+            <div class="asset-actions">
+              <button class="btn btn-outline btn-sm" type="button" data-action="generate-stage-clip" data-stage="${index}" ${canGenerate && clipReady ? '' : 'disabled'}>${clip ? 'Reroll clip' : 'Generate clip'}</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-action="pick-asset" data-stage="${index}" data-kind="clip">Upload</button>
+              ${clip ? `<a class="btn btn-ghost btn-sm" href="${mediaUrl(projectId, stage.id, clip.file, { download: true })}">Download</a><button class="btn btn-ghost btn-sm is-danger-text" type="button" data-action="delete-asset" data-stage="${index}" data-asset-id="${esc(clip.id)}" data-kind="clip">Remove</button>` : ''}
+            </div>
+            <input type="file" hidden data-action="import-file" data-stage="${index}" data-kind="clip" accept="video/mp4,video/webm,video/quicktime" />
+          </div>
+          ${clip && staleClip ? '<p class="asset-warning">The motion prompt changed after this clip. Reroll to match the current storyboard.</p>' : ''}
+          ${clip?.warnings?.length ? `<p class="asset-warning">${esc(clip.warnings[0])}</p>` : ''}
+          ${!clipReady ? '<p class="asset-hint">Generate the image, review continuity, then approve it. The clip button unlocks after approval.</p>' : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function stageRailImage(stage) {
+  const image = selectedImage(stage.id);
+  if (!image) return null;
+  const approved = Boolean(
+    image.approved || image.id === stageGeneration(stage.id)?.approvedImageId,
+  );
+  return `<div class="frame-tile has-photo">
+    <img class="stage-photo" src="${mediaUrl(state.project.id, stage.id, image.file)}" alt="${esc(stage.name)} generated stage image" loading="lazy" />
+    <span class="frame-badge">${esc(stage.id)}</span>
+    <span class="stage-photo-badge ${approved ? 'is-approved' : ''}">${approved ? '✓ approved' : 'draft'}</span>
+  </div>`;
+}
 function stageCard(stage, index, palette) {
   const negative = state.expanded[`${index}:negative`];
+  const clip = selectedClip(stage.id);
   return `
     <article class="card stage-card" id="stage-${index}">
       <div class="stage-rail">
-        ${stageFrame(stage, index, palette)}
+        ${stageRailImage(stage) ?? stageFrame(stage, index, palette)}
         <div class="stage-rail-meta">
           <span>🎥 ${esc(stage.camera)}</span>
           <span>⏱ ${stage.duration ?? 5}s clip · 9:16</span>
           <span>🧂 ${esc((stage.ingredients ?? '').split(',').slice(0, 2).join(', '))}</span>
+          ${clip ? '<span class="rail-clip">🎞 clip ready</span>' : ''}
         </div>
       </div>
       <div class="stage-main">
@@ -917,6 +1313,7 @@ function stageCard(stage, index, palette) {
             <button class="btn btn-outline btn-sm" type="button" data-action="reroll-stage" data-stage="${index}">Reroll prompts</button>
           </div>
         </div>
+        ${assetPanel(stage, index)}
         ${promptBlock(stage, index, 'image')}
         ${promptBlock(stage, index, 'motion')}
         ${promptBlock(stage, index, 'audio')}
@@ -944,7 +1341,7 @@ NEGATIVE PROMPT:
 ${stage.negativePrompt}`;
 }
 
-function renderStoryboardView() {
+function renderStoryboardView({ preserveScroll = false } = {}) {
   const project = state.project;
   const storyboard = project.storyboard;
   const palette = project.dish.palette ?? project.audienceMeta?.palette ?? [];
@@ -1032,6 +1429,8 @@ function renderStoryboardView() {
           </div>`
     }
 
+    ${flowPanelHtml(project)}
+
     <div class="continuity-strip">
       <div class="lock-chip"><small>Scale</small><strong>${esc(storyboard.summary.scale)}</strong></div>
       <div class="lock-chip"><small>Hands</small><strong>${esc(storyboard.summary.hands)}</strong></div>
@@ -1047,7 +1446,7 @@ function renderStoryboardView() {
     <div class="stage-list">
       ${storyboard.stages.map((stage, index) => stageCard(stage, index, palette)).join('')}
     </div>
-  `);
+  `, { focus: !preserveScroll, scroll: !preserveScroll });
 }
 
 /* ==========================================================================
@@ -1075,6 +1474,13 @@ function renderProductionView() {
   const audit = storyboard.audit ?? { checks: [] };
   const jobs = project.render?.jobs ?? [];
   const render = state.render;
+  const flowSummary = generationSummary(project.generation);
+  const flowStages = storyboard.stages.filter(
+    (stage) => (stageGeneration(stage.id)?.images?.length ?? 0) > 0,
+  ).length;
+  const flowClips = storyboard.stages.filter(
+    (stage) => (stageGeneration(stage.id)?.clips?.length ?? 0) > 0,
+  ).length;
 
   renderView(`
     <section class="page-head">
@@ -1094,11 +1500,15 @@ function renderProductionView() {
     <div class="production-grid">
       <article class="card export-card">
         <h3>Download artifacts</h3>
-        <p>Choose a format. The ZIP pack contains every stage as separate image, motion and audio prompt files.</p>
+        <p>Choose a format. The ZIP pack contains every stage prompt plus any Flow-generated images and clips, and a ready-to-open Flow board.</p>
         <div class="export-list">
           <a class="download-link" href="/api/projects/${esc(project.id)}/export?format=zip">
             <span class="dl-icon">⤓</span>
-            <span><strong>Full production pack (.zip)</strong><small>README · manifest · shot list · per-stage prompts</small></span>
+            <span><strong>Full production pack (.zip)</strong><small>README · manifest · prompts · media · Flow board</small></span>
+          </a>
+          <a class="download-link" href="/api/projects/${esc(project.id)}/export?format=flow">
+            <span class="dl-icon">◈</span>
+            <span><strong>Google Flow pack (.zip)</strong><small>Flow board · image + video prompts · approved media</small></span>
           </a>
           <a class="download-link" href="/api/projects/${esc(project.id)}/export?format=md">
             <span class="dl-icon">≡</span>
@@ -1117,6 +1527,22 @@ function renderProductionView() {
             <span><strong>Render handoff</strong><small>Model-agnostic job manifest</small></span>
           </a>
         </div>
+      </article>
+
+      <article class="card export-card">
+        <h3>Google Flow media</h3>
+        <p>Generated and imported stage media stays local. Approve images on the storyboard before animating them with Flow.</p>
+        <div class="production-flow-stats">
+          <div class="flow-stat"><small>Images</small><strong>${flowSummary.images}</strong><span>${flowStages}/${storyboard.totalStages} stages covered</span></div>
+          <div class="flow-stat"><small>Clips</small><strong>${flowSummary.clips}</strong><span>${flowClips}/${storyboard.totalStages} stages covered</span></div>
+          <div class="flow-stat"><small>Approved</small><strong>${flowSummary.approvedImages}</strong><span>images ready for video</span></div>
+        </div>
+        <div class="flow-actions" style="margin-top:14px">
+          <button class="btn btn-outline btn-sm" type="button" data-action="goto-step" data-step="storyboard">Review Flow assets</button>
+          <button class="btn btn-ghost btn-sm" type="button" data-action="open-flow">${esc(flowStatusLabel())}</button>
+          <a class="btn btn-ghost btn-sm" href="/api/projects/${esc(project.id)}/export?format=flow">Download Flow pack</a>
+        </div>
+        <p class="small faint">Flow generation uses your own account and credits. The pack is the stable fallback if Flow’s UI changes.</p>
       </article>
 
       <article class="card export-card">
@@ -1300,11 +1726,12 @@ function closeModal() {
   root.hidden = true;
   root.innerHTML = '';
   document.body.style.overflow = '';
+  syncFlowPolling();
 }
 
-function openModal(html, { onOpen } = {}) {
+function openModal(html, { onOpen, type = 'generic' } = {}) {
   const root = $('#modalRoot');
-  state.modal = true;
+  state.modal = type;
   root.hidden = false;
   root.innerHTML = `<div class="modal-scrim" data-action="close-modal"></div>${html}`;
   document.body.style.overflow = 'hidden';
@@ -1371,6 +1798,207 @@ VIDMO_RENDER_CALLBACK_SECRET=optional-callback-secret</div>
     </section>
   `);
 }
+
+function flowModalHtml() {
+  const flow = state.flow;
+  const diagnostics = state.flowDiagnostics;
+  const connected = isFlowConnected();
+  const mode = flow?.mode === 'stub' ? 'Simulator' : 'Your Google account';
+  const status = flow?.status ?? 'disconnected';
+
+  return `
+    <section class="modal-card flow-modal-card" role="dialog" aria-modal="true" aria-label="Google Flow connection">
+      <header class="modal-head">
+        <div>
+          <span class="eyebrow">Generation engine</span>
+          <h2>Google Flow</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-modal" aria-label="Close Flow settings">✕</button>
+      </header>
+      <div class="modal-body">
+        <div class="flow-modal-status is-${esc(status)}">
+          <span class="status-dot"></span>
+          <div>
+            <strong>${esc(flowStatusLabel(flow))}</strong>
+            <p>${esc(flow?.message ?? 'Connect Flow to generate stage images and clips.')}</p>
+          </div>
+          ${flow?.mode === 'stub' ? '<span class="chip chip-amber">Simulator</span>' : ''}
+        </div>
+
+        <div class="flow-kv-grid">
+          <div class="kv"><span>Engine</span><strong>${esc(mode)}</strong></div>
+          <div class="kv"><span>Browser</span><strong>${esc(flow?.browser || (flow?.mode === 'stub' ? 'None — local simulator' : 'Chrome / Edge'))}</strong></div>
+          <div class="kv"><span>Local profile</span><strong class="mono">${esc(flow?.profile || 'data/flow-profile')}</strong></div>
+          <div class="kv"><span>Credits</span><strong>Your Flow account</strong></div>
+        </div>
+
+        ${
+          flow?.mode === 'stub'
+            ? `<div class="modal-section">
+                <h3>Simulator mode</h3>
+                <p class="small muted">The built-in simulator creates placeholder images and clips without opening Flow or spending credits. It is useful for testing the pipeline. To use your own account, restart VidMo with <span class="mono">VIDMO_FLOW_MODE=browser</span>.</p>
+                <div class="code-note">set VIDMO_FLOW_MODE=browser
+npm install playwright-core
+npm start</div>
+              </div>`
+            : ``
+        }
+
+        ${
+          flow && !flow.configured
+            ? `<div class="modal-section">
+                <h3>Install the browser driver</h3>
+                <p class="small muted">Flow is a signed-in web app, so VidMo needs the optional Playwright driver to open a visible Chrome window. The core studio still works without it, and the Flow pack export remains available.</p>
+                <div class="code-note">npm install playwright-core
+npm start</div>
+                <p class="small faint">${esc(flow.installNote || '')}</p>
+              </div>`
+            : ``
+        }
+
+        ${
+          flow?.mode !== 'stub' && !connected
+            ? `<div class="modal-section">
+                <h3>Connect your own account</h3>
+                <ol class="flow-steps">
+                  <li>VidMo opens a visible Chrome window with a dedicated local profile.</li>
+                  <li>Sign in to Google Flow yourself in that window. VidMo never sees the password.</li>
+                  <li>Return here. VidMo detects sign-in automatically; then generate images first and clips second.</li>
+                </ol>
+                <label class="consent-row">
+                  <input type="checkbox" id="flowConsent" ${state.flowConsent ? 'checked' : ''} />
+                  <span>I understand that VidMo will automate clicks in my signed-in Flow session, and that generations spend Flow credits from my own Google account.</span>
+                </label>
+                <div class="flow-actions">
+                  <button class="btn btn-primary" type="button" data-action="connect-flow" ${state.flowConsent ? '' : 'disabled'}>Open Flow in Chrome</button>
+                  <a class="btn btn-ghost" href="https://labs.google/fx/tools/flow" target="_blank" rel="noreferrer">Open Flow in my browser</a>
+                </div>
+                <p class="small faint">No iframe, OAuth shortcut or credential storage. Flow has no public API, so this is a real browser session under your control.</p>
+              </div>`
+            : ``
+        }
+
+        ${
+          connected && flow?.mode !== 'stub'
+            ? `<div class="modal-section">
+                <h3>Session controls</h3>
+                <p class="small muted">${esc(flow?.message || 'Flow is ready.')}</p>
+                <div class="flow-actions">
+                  <button class="btn btn-outline btn-sm" type="button" data-action="focus-flow">Bring Flow to front</button>
+                  ${
+                    flow?.status === 'attention'
+                      ? '<button class="btn btn-primary btn-sm" type="button" data-action="resume-flow">Resume generation</button>'
+                      : '<button class="btn btn-ghost btn-sm" type="button" data-action="pause-flow">Pause</button>'
+                  }
+                  <button class="btn btn-ghost btn-sm" type="button" data-action="capture-flow">Capture diagnostics</button>
+                  <button class="btn btn-ghost btn-sm" type="button" data-action="disconnect-flow">Disconnect</button>
+                  <button class="btn btn-ghost btn-sm is-danger-text" type="button" data-action="clear-flow-profile">Clear local profile</button>
+                </div>
+                <p class="small faint">The profile is <span class="mono">${esc(flow?.profile ?? 'data/flow-profile')}</span>. It stays on this computer. Disconnecting closes the window; clearing also removes the local Google session for this profile.</p>
+              </div>
+
+              <div class="modal-section">
+                <h3>What VidMo can automate</h3>
+                <div class="flow-capabilities">
+                  <span>Image model + 9:16</span>
+                  <span>Locked image prompt</span>
+                  <span>Image approval gate</span>
+                  <span>Video / Frames</span>
+                  <span>Start-frame upload</span>
+                  <span>Captions off · ASMR lock</span>
+                </div>
+                <p class="small muted">Flow’s UI is not a public API. If it changes, VidMo pauses on captcha/credits/terms, saves a screenshot, and lets you capture selectors for repair. Nothing is bypassed.</p>
+              </div>`
+            : ``
+        }
+
+        ${
+          flow?.screenshotUrl
+            ? `<div class="modal-section">
+                <h3>Latest Flow screenshot</h3>
+                <a class="flow-shot-link" href="${esc(flow.screenshotUrl)}" target="_blank" rel="noreferrer">
+                  <img class="flow-shot" src="${esc(flow.screenshotUrl)}" alt="Latest Google Flow browser screenshot" />
+                </a>
+                <p class="small faint">Captured locally on this machine. It may contain your Flow project names and media.</p>
+              </div>`
+            : ``
+        }
+
+        ${
+          diagnostics
+            ? `<div class="modal-section">
+                <h3>Diagnostics</h3>
+                <p class="small muted">Saved at <span class="mono">${esc(diagnostics.file ?? 'data/flow/diagnostics')}</span> · ${diagnostics.visibleElements ?? 0} visible controls · ${esc(diagnostics.savedAt ?? '')}</p>
+                ${
+                  diagnostics.screenshotUrl
+                    ? `<a class="btn btn-ghost btn-sm" href="${esc(diagnostics.screenshotUrl)}" target="_blank" rel="noreferrer">Open screenshot</a>`
+                    : ''
+                }
+                <div class="diag-list">
+                  ${(diagnostics.elements ?? [])
+                    .slice(0, 12)
+                    .map(
+                      (element) =>
+                        `<span><strong>${esc(element.tag)}</strong>${element.role ? ` · ${esc(element.role)}` : ''} · ${esc(element.name || '(no label)')}</span>`,
+                    )
+                    .join('')}
+                </div>
+                <p class="small faint">If a selector fails, this JSON + ARIA snapshot is what to inspect or attach to a bug report. Prompts and page text stay local.</p>
+              </div>`
+            : ``
+        }
+
+        <div class="modal-section">
+          <h3>Privacy &amp; terms</h3>
+          <p class="small muted">VidMo does not ask for, proxy or store Google credentials. You sign in directly in Google’s page. The local browser profile and generated media live under <span class="mono">data/</span>. Flow usage is subject to Google’s terms and credit pricing; VidMo is not affiliated with Google.</p>
+          <div class="kv"><span>Audio lock</span><strong>ASMR only · no music · no voice</strong></div>
+          <div class="kv"><span>Image gate</span><strong>Approve before image-to-video</strong></div>
+        </div>
+      </div>
+    </section>`;
+}
+
+function flowSignature(flow = state.flow, diagnostics = state.flowDiagnostics) {
+  return JSON.stringify([
+    flow?.mode,
+    flow?.status,
+    flow?.message,
+    flow?.configured,
+    flow?.installNote,
+    flow?.connected,
+    flow?.attention,
+    flow?.paused,
+    flow?.screenshotUrl,
+    flow?.browser,
+    flow?.profile,
+    flow?.url,
+    flow?.lastError,
+    diagnostics?.savedAt ?? null,
+  ]);
+}
+
+function openFlowModal() {
+  state.flowSignature = flowSignature();
+  openModal(flowModalHtml(), { type: 'flow' });
+  syncFlowPolling();
+}
+
+function refreshFlowModal() {
+  if (state.modal !== 'flow') return;
+  const root = $('#modalRoot');
+  if (!root || root.hidden) return;
+  const signature = flowSignature();
+  // Re-rendering restarts the modal entry animation, so only refresh when the
+  // Flow state actually changed.
+  if (signature === state.flowSignature) return;
+  state.flowSignature = signature;
+  const body = $('.modal-body', root);
+  const scroll = body?.scrollTop ?? 0;
+  root.innerHTML = `<div class="modal-scrim" data-action="close-modal"></div>${flowModalHtml()}`;
+  const nextBody = $('.modal-body', root);
+  if (nextBody) nextBody.scrollTop = scroll;
+}
+
 
 function openDeleteModal(id) {
   const project = state.projects.find((item) => item.id === id);
@@ -1504,6 +2132,355 @@ async function deleteProject(id) {
   } else {
     toast('Film deleted', 'info');
     renderShell();
+  }
+}
+
+async function startGeneration(kind, { stageIds = [], autoApprove = false, confirmation } = {}) {
+  const project = state.project;
+  if (!project) return;
+  if (confirmation && !window.confirm(confirmation)) return;
+  const data = await api(`/api/projects/${project.id}/generate/${kind}`, {
+    method: 'POST',
+    body: { stageIds, autoApprove },
+  });
+  state.project = data.project;
+  rememberProject(data.project);
+  state.lastGenerationStatus = data.generation?.status ?? null;
+  state.lastGenerationCount = -1;
+  renderShell();
+  if (state.routeSection === 'storyboard') renderStoryboardView({ preserveScroll: true });
+  else if (state.routeSection === 'production') renderProductionView();
+  startGenerationPolling();
+  syncFlowPolling();
+  toast(
+    kind === 'images'
+      ? `Flow queued ${plural(stageIds.length || project.storyboard.totalStages, 'stage image')}`
+      : `Flow queued ${plural(stageIds.length || project.storyboard.totalStages, 'clip')}`,
+    'success',
+  );
+}
+
+async function generateAllImages() {
+  const project = state.project;
+  const count = project.storyboard.totalStages;
+  await startGeneration('images', {
+    stageIds: project.storyboard.stages.map((stage) => stage.id),
+    autoApprove: false,
+    confirmation: `Generate ${plural(count, 'stage image')} in Google Flow? This spends Flow credits from your own account and takes a few minutes per image.`,
+  });
+}
+
+async function generateAllClips() {
+  const project = state.project;
+  const approved = project.storyboard.stages.every(
+    (stage) => stageGeneration(stage.id)?.approvedImageId,
+  );
+  if (!approved) {
+    toast('Approve one image on every stage before generating clips', 'error');
+    return;
+  }
+  await startGeneration('clips', {
+    stageIds: project.storyboard.stages.map((stage) => stage.id),
+    confirmation: `Generate ${plural(project.storyboard.totalStages, 'video clip')} in Flow? This spends Flow credits and can take several minutes per clip.`,
+  });
+}
+
+async function generateStageImage(index) {
+  const stage = state.project.storyboard.stages[index];
+  await startGeneration('images', {
+    stageIds: [stage.id],
+    confirmation: `Generate a new image for ${stage.id} in Google Flow? This spends one Flow credit.`,
+  });
+}
+
+async function generateStageClip(index) {
+  const stage = state.project.storyboard.stages[index];
+  if (!stageGeneration(stage.id)?.approvedImageId) {
+    toast('Approve a stage image first — it becomes the video start frame', 'error');
+    return;
+  }
+  await startGeneration('clips', {
+    stageIds: [stage.id],
+    confirmation: `Animate ${stage.id} in Google Flow? This spends Flow credits and can take several minutes.`,
+  });
+}
+
+async function approveAllImages() {
+  const data = await api(`/api/projects/${state.project.id}/approve-images`, {
+    method: 'POST',
+    body: { stageIds: [], approved: true },
+  });
+  state.project = data.project;
+  rememberProject(data.project);
+  toast('Latest stage image approved on every stage that has one', 'success');
+  renderStoryboardView({ preserveScroll: true });
+}
+
+async function approveAsset(index, assetId) {
+  const stage = state.project.storyboard.stages[index];
+  const data = await api(
+    `/api/projects/${state.project.id}/stages/${index + 1}/assets/${encodeURIComponent(assetId)}`,
+    { method: 'PATCH', body: { approved: true } },
+  );
+  state.project = data.project;
+  rememberProject(data.project);
+  toast(`${stage.id} image approved — clip generation unlocked`, 'success');
+  renderStoryboardView({ preserveScroll: true });
+}
+
+async function deleteAsset(index, assetId, kind) {
+  const stage = state.project.storyboard.stages[index];
+  if (!window.confirm(`Remove this ${kind} from ${stage.id}? The local file is deleted too.`)) return;
+  const data = await api(
+    `/api/projects/${state.project.id}/stages/${index + 1}/assets/${encodeURIComponent(assetId)}`,
+    { method: 'DELETE' },
+  );
+  state.project = data.project;
+  rememberProject(data.project);
+  toast(`${kind === 'image' ? 'Image' : 'Clip'} removed from ${stage.id}`, 'info');
+  renderStoryboardView({ preserveScroll: true });
+}
+
+function pickAsset(index, kind) {
+  const input = $(
+    `input[data-action="import-file"][data-stage="${index}"][data-kind="${kind}"]`,
+  );
+  if (input) input.click();
+}
+
+async function uploadAsset(input) {
+  const file = input.files?.[0];
+  if (!file) return;
+  const index = Number(input.dataset.stage);
+  const kind = input.dataset.kind;
+  const stage = state.project.storyboard.stages[index];
+  if (!stage) return;
+  if (!['image', 'clip'].includes(kind)) return;
+  const maxBytes = 250 * 1024 * 1024;
+  if (file.size > maxBytes) {
+    toast('File is larger than the 250 MB upload limit', 'error');
+    input.value = '';
+    return;
+  }
+  try {
+    const response = await fetch(
+      `/api/projects/${state.project.id}/stages/${index + 1}/assets?kind=${kind}&filename=${encodeURIComponent(
+        file.name,
+      )}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      },
+    );
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.message || `Upload failed (${response.status})`);
+    state.project = data.project;
+    rememberProject(data.project);
+    toast(
+      kind === 'image'
+        ? `${stage.id} image uploaded — approve it after reviewing continuity`
+        : `${stage.id} clip uploaded`,
+      'success',
+    );
+    renderStoryboardView({ preserveScroll: true });
+  } catch (error) {
+    toast(error.message, 'error');
+  } finally {
+    input.value = '';
+  }
+}
+
+async function cancelGeneration() {
+  const data = await api(`/api/projects/${state.project.id}/generate/cancel`, {
+    method: 'POST',
+    body: {},
+  });
+  state.project = data.project;
+  rememberProject(data.project);
+  toast('Cancelling Flow generation…', 'info');
+  renderStoryboardView({ preserveScroll: true });
+  startGenerationPolling();
+}
+
+function scrollToStage(index) {
+  const target = $(`#stage-${index}`);
+  if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function updateFlowPanelDom() {
+  const panel = $('#flowPanel');
+  if (panel && state.project?.storyboard && state.routeSection === 'storyboard') {
+    panel.outerHTML = flowPanelHtml(state.project);
+  }
+  renderTopbarActions();
+}
+
+async function connectFlow() {
+  const data = await api('/api/flow/connect', { method: 'POST', body: { consent: true } });
+  state.flow = data.flow;
+  renderShell();
+  refreshFlowModal();
+  syncFlowPolling();
+  toast(
+    state.flow.mode === 'stub'
+      ? 'Flow simulator ready'
+      : 'Flow window opened — sign in there, VidMo will detect it',
+    'success',
+  );
+}
+
+async function disconnectFlow(clearProfile = false) {
+  const data = await api('/api/flow/disconnect', {
+    method: 'POST',
+    body: { clearProfile },
+  });
+  state.flow = data.flow;
+  renderShell();
+  refreshFlowModal();
+  syncFlowPolling();
+  toast(clearProfile ? 'Flow session cleared' : 'Flow disconnected', 'info');
+}
+
+async function clearFlowProfile() {
+  if (
+    !window.confirm(
+      'Clear the local Flow browser profile? This signs the dedicated VidMo Chrome profile out of Google and deletes its cookies.',
+    )
+  ) {
+    return;
+  }
+  await disconnectFlow(true);
+}
+
+async function pauseFlow() {
+  const data = await api('/api/flow/pause', {
+    method: 'POST',
+    body: { reason: 'Paused by you. Resolve anything in the Flow window, then resume.' },
+  });
+  state.flow = data.flow;
+  renderShell();
+  refreshFlowModal();
+  syncFlowPolling();
+}
+
+async function resumeFlow() {
+  const data = await api('/api/flow/resume', { method: 'POST', body: {} });
+  state.flow = data.flow;
+  renderShell();
+  refreshFlowModal();
+  syncFlowPolling();
+  toast('Flow resumed', 'success');
+}
+
+async function focusFlow() {
+  const data = await api('/api/flow/focus', { method: 'POST', body: {} });
+  state.flow = data.flow;
+  refreshFlowModal();
+}
+
+async function captureFlowDiagnostics() {
+  const data = await api('/api/flow/diagnostics', { method: 'POST', body: {} });
+  state.flowDiagnostics = data.diagnostics;
+  state.flow = data.flow;
+  refreshFlowModal();
+  toast('Flow diagnostics saved locally', 'success');
+}
+
+async function refreshFlowStatus() {
+  const data = await api('/api/flow/status');
+  state.flow = data.flow;
+  renderStatusChips();
+  updateFlowPanelDom();
+  refreshFlowModal();
+  syncFlowPolling();
+}
+
+function needsFlowPolling() {
+  const status = state.flow?.status;
+  return (
+    state.modal === 'flow' ||
+    ['launching', 'awaiting_login', 'attention', 'busy'].includes(status) ||
+    isGenerationActive()
+  );
+}
+
+function syncFlowPolling() {
+  if (needsFlowPolling()) {
+    if (!state.flowTimer) {
+      state.flowTimer = setInterval(() => {
+        refreshFlowStatus().catch(() => {});
+      }, 2500);
+    }
+  } else if (state.flowTimer) {
+    clearInterval(state.flowTimer);
+    state.flowTimer = null;
+  }
+}
+
+const TERMINAL_GENERATION_STATUSES = ['complete', 'partial', 'error', 'cancelled', 'interrupted'];
+
+function startGenerationPolling() {
+  if (state.generationTimer) return;
+  state.generationTimer = setInterval(() => {
+    refreshProjectGeneration().catch(() => {});
+  }, 1800);
+}
+
+function stopGenerationPolling() {
+  if (state.generationTimer) clearInterval(state.generationTimer);
+  state.generationTimer = null;
+}
+
+async function refreshProjectGeneration() {
+  if (state.polling || !state.project) return;
+  state.polling = true;
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(state.project.id)}`);
+    const project = data.project;
+    if (!project) return;
+    const previousStatus = state.lastGenerationStatus;
+    const previousCount = state.lastGenerationCount;
+    const generation = project.generation;
+    const count =
+      (generation?.summary?.images ?? 0) + (generation?.summary?.clips ?? 0);
+    state.project = project;
+    rememberProject(project);
+
+    const status = generation?.status ?? null;
+    const changed = count !== previousCount;
+    const terminalNow =
+      status && TERMINAL_GENERATION_STATUSES.includes(status) && status !== previousStatus;
+
+    if (state.routeSection === 'storyboard') {
+      if ((changed || terminalNow) && !state.editing) {
+        renderStoryboardView({ preserveScroll: true });
+      } else {
+        updateFlowPanelDom();
+      }
+    } else if (state.routeSection === 'production') {
+      if (changed || terminalNow) renderProductionView();
+    } else {
+      updateFlowPanelDom();
+    }
+    renderStatusChips();
+
+    if (terminalNow) {
+      stopGenerationPolling();
+      toast(
+        generation.message || 'Flow generation finished',
+        status === 'complete' ? 'success' : status === 'cancelled' ? 'info' : 'error',
+        6500,
+      );
+    }
+    state.lastGenerationStatus = status;
+    state.lastGenerationCount = count;
+    if (!isGenerationActive(generation)) {
+      stopGenerationPolling();
+      syncFlowPolling();
+    }
+  } finally {
+    state.polling = false;
   }
 }
 
@@ -1652,6 +2629,82 @@ document.addEventListener('click', async (event) => {
     await runAction(target, () => queueRender());
     return;
   }
+  if (action === 'open-flow') {
+    openFlowModal();
+    return;
+  }
+  if (action === 'connect-flow') {
+    await runAction(target, () => connectFlow());
+    return;
+  }
+  if (action === 'disconnect-flow') {
+    await runAction(target, () => disconnectFlow(false));
+    return;
+  }
+  if (action === 'clear-flow-profile') {
+    await runAction(target, () => clearFlowProfile());
+    return;
+  }
+  if (action === 'pause-flow') {
+    await runAction(target, () => pauseFlow());
+    return;
+  }
+  if (action === 'resume-flow') {
+    await runAction(target, () => resumeFlow());
+    return;
+  }
+  if (action === 'focus-flow') {
+    await runAction(target, () => focusFlow());
+    return;
+  }
+  if (action === 'capture-flow') {
+    await runAction(target, () => captureFlowDiagnostics());
+    return;
+  }
+  if (action === 'generate-images') {
+    await runAction(target, () => generateAllImages());
+    return;
+  }
+  if (action === 'generate-clips') {
+    await runAction(target, () => generateAllClips());
+    return;
+  }
+  if (action === 'generate-stage-image') {
+    await runAction(target, () => generateStageImage(Number(target.dataset.stage)));
+    return;
+  }
+  if (action === 'generate-stage-clip') {
+    await runAction(target, () => generateStageClip(Number(target.dataset.stage)));
+    return;
+  }
+  if (action === 'approve-images') {
+    await runAction(target, () => approveAllImages());
+    return;
+  }
+  if (action === 'approve-asset') {
+    await runAction(target, () =>
+      approveAsset(Number(target.dataset.stage), target.dataset.assetId),
+    );
+    return;
+  }
+  if (action === 'delete-asset') {
+    await runAction(target, () =>
+      deleteAsset(Number(target.dataset.stage), target.dataset.assetId, target.dataset.kind),
+    );
+    return;
+  }
+  if (action === 'pick-asset') {
+    pickAsset(Number(target.dataset.stage), target.dataset.kind);
+    return;
+  }
+  if (action === 'cancel-generation') {
+    await runAction(target, () => cancelGeneration());
+    return;
+  }
+  if (action === 'scroll-stage') {
+    scrollToStage(Number(target.dataset.stage));
+    return;
+  }
 });
 
 document.addEventListener('input', (event) => {
@@ -1662,6 +2715,17 @@ document.addEventListener('input', (event) => {
 
 document.addEventListener('change', async (event) => {
   const target = event.target;
+  if (target.id === 'flowConsent') {
+    state.flowConsent = Boolean(target.checked);
+    saveJson('vidmo.flowConsent', state.flowConsent);
+    const button = $('[data-action="connect-flow"]');
+    if (button) button.disabled = !state.flowConsent;
+    return;
+  }
+  if (target.matches('input[data-action="import-file"]')) {
+    await uploadAsset(target);
+    return;
+  }
   if (target.id !== 'defaultModel' && target.id !== 'modalDefaultModel') return;
   try {
     const data = await api('/api/settings', {
@@ -1697,6 +2761,7 @@ async function loadBootstrap() {
   state.projects = data.projects ?? [];
   state.ai = data.ai;
   state.render = data.render;
+  state.flow = data.flow;
   state.settings = data.settings;
 }
 

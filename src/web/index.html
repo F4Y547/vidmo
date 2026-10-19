@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="VidMo Studio turns one dish idea into a complete miniature cooking video production package: stage plan, macro image prompts, motion prompts and locked ASMR audio direction."
+      content="VidMo Studio turns one dish idea into a complete miniature cooking video production package: stage plan, macro image prompts, motion prompts and locked ASMR audio direction — with optional Google Flow image and image-to-video generation in your own account."
     />
     <meta name="theme-color" content="#0b0a09" />
-    <title>VidMo Studio — Miniature Cooking Film Automation</title>
+    <title>VidMo Studio — Miniature Cooking Film Automation + Google Flow</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -43,6 +43,9 @@
         </section>
 
         <footer class="sidebar-foot">
+          <button class="status-chip" id="flowChip" data-action="open-flow" type="button">
+            <span class="status-dot"></span><span class="status-label">Flow: not connected</span>
+          </button>
           <button class="status-chip" id="aiChip" data-action="open-settings" type="button">
             <span class="status-dot"></span><span class="status-label">AI: local engine</span>
           </button>

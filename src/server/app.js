@@ -1,4 +1,6 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, createWriteStream, createReadStream } from 'node:fs';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
@@ -18,15 +20,31 @@ import {
   buildSocialMarkdown,
   projectExportName,
 } from '../engine/exports.js';
+import { buildFlowPackFiles } from '../engine/flow.js';
 import { getAiStatus, planCustomDishWithAI } from './ai.js';
 import { readStore, transact } from './store.js';
 import { createZip } from './zip.js';
+import { flowSession } from './flow/session.js';
+import {
+  decorateProject,
+  generationManager,
+  GenerationError,
+} from './generation.js';
+import {
+  MAX_UPLOAD_BYTES,
+  assetFilePath,
+  createUploadTempPath,
+  isAllowedMediaFile,
+  mediaContentType,
+  removeProjectMedia,
+} from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(__dirname, '..', 'web');
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const VIDEO_MODELS = ['Google Veo 3.1', 'Kling 2.5', 'Runway Gen-4', 'Sora 2'];
+
 
 class HttpError extends Error {
   constructor(statusCode, code, message, details) {
@@ -43,7 +61,7 @@ function baseHeaders(contentType) {
     'Referrer-Policy': 'same-origin',
     'X-Frame-Options': 'DENY',
     'Content-Security-Policy':
-      "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+      "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
   };
   if (contentType) headers['Content-Type'] = contentType;
   return headers;
@@ -128,6 +146,9 @@ function projectSummary(project) {
   } catch {
     fallbackAudience = null;
   }
+  const stageGenerations = Object.values(project.generation?.stages ?? {});
+  const imagesGenerated = stageGenerations.reduce((sum, stage) => sum + (stage.images?.length ?? 0), 0);
+  const clipsGenerated = stageGenerations.reduce((sum, stage) => sum + (stage.clips?.length ?? 0), 0);
   return {
     id: project.id,
     title: project.title,
@@ -140,12 +161,16 @@ function projectSummary(project) {
     updatedAt: project.updatedAt,
     createdAt: project.createdAt,
     accent: project.dish?.accent ?? fallbackAudience?.palette?.[0] ?? '#e0a458',
+    generationStatus: project.generation?.status ?? null,
+    imagesGenerated,
+    clipsGenerated,
   };
 }
 
 function serializeProject(project) {
-  return project;
+  return decorateProject(project);
 }
+
 
 function findProject(store, id) {
   const project = store.projects.find((item) => item.id === id);
@@ -191,6 +216,7 @@ function getSettings(store) {
 }
 
 async function getBootstrap() {
+  await generationManager.recoverInterrupted();
   const store = await readStore();
   return {
     app: {
@@ -216,12 +242,14 @@ async function getBootstrap() {
       .map(projectSummary),
     ai: getAiStatus(),
     render: getRenderConfig(),
+    flow: await flowSession.describe(),
     settings: getSettings(store),
   };
 }
 
-function buildPackFiles(project) {
+async function buildPackFiles(project, { assets = null } = {}) {
   const storyboard = project.storyboard;
+  const assetFiles = assets ?? (await generationManager.collectAssetFiles(project));
   const files = [
     { name: 'README.txt', data: buildPackReadme(project) },
     { name: 'project.md', data: buildMarkdown(project) },
@@ -232,6 +260,8 @@ function buildPackFiles(project) {
     { name: 'shot-list.csv', data: buildShotListCsv(project) },
     { name: 'social-copy.md', data: buildSocialMarkdown(project) },
     { name: 'render-handoff.json', data: JSON.stringify(buildRenderHandoff(project), null, 2) },
+    ...buildFlowPackFiles(project, assetFiles),
+    ...assetFiles,
   ];
 
   for (const [index, stage] of storyboard.stages.entries()) {
@@ -244,8 +274,9 @@ function buildPackFiles(project) {
   return files;
 }
 
-function buildExport(project, format) {
+async function buildExport(project, format) {
   const base = projectExportName(project);
+  const assetFiles = await generationManager.collectAssetFiles(project);
   if (format === 'md') {
     return {
       filename: `${base}.md`,
@@ -274,14 +305,28 @@ function buildExport(project, format) {
       data: JSON.stringify(buildRenderHandoff(project), null, 2),
     };
   }
+  if (format === 'flow') {
+    return {
+      filename: `${base}-flow-pack.zip`,
+      contentType: 'application/zip',
+      data: createZip([
+        ...buildFlowPackFiles(project, assetFiles),
+        { name: 'continuity-bible.md', data: buildContinuityMarkdown(project) },
+        { name: 'negative-prompt.txt', data: project.storyboard.negativePrompt },
+        { name: 'thumbnail-prompt.txt', data: project.storyboard.thumbnailPrompt },
+        { name: 'manifest.json', data: buildProjectJson(project) },
+        ...assetFiles,
+      ]),
+    };
+  }
   if (format === 'zip') {
     return {
       filename: `${base}-pack.zip`,
       contentType: 'application/zip',
-      data: createZip(buildPackFiles(project)),
+      data: createZip(await buildPackFiles(project, { assets: assetFiles })),
     };
   }
-  throw new HttpError(400, 'unsupported_format', 'Format must be md, json, csv, handoff or zip');
+  throw new HttpError(400, 'unsupported_format', 'Format must be md, json, csv, handoff, flow or zip');
 }
 
 const MIME_TYPES = {
@@ -356,6 +401,7 @@ async function handleCreateProject(req, res) {
     rerolls: 0,
     planningNote: `10 ${board.audience.shortLabel} dish ideas ready. Select one or enter a custom dish.`,
     render: { status: 'not-submitted', jobs: [] },
+    generation: null,
     createdAt,
     updatedAt: createdAt,
   };
@@ -372,11 +418,13 @@ async function handleGetProject(req, res, id) {
 }
 
 async function handleDeleteProject(req, res, id) {
+  await generationManager.resetProjectAssets(id).catch(() => {});
   await transact((store) => {
     const index = store.projects.findIndex((project) => project.id === id);
     if (index < 0) throw new HttpError(404, 'project_not_found', 'Project not found');
     store.projects.splice(index, 1);
   });
+  await removeProjectMedia(id);
   sendEmpty(res);
 }
 
@@ -433,12 +481,14 @@ async function handleSelectDish(req, res, id) {
     planningNote = `Library recipe plan · ${selection.analysis.complexityLabel} · ${selection.dish.stages.length} stages.`;
   }
 
+  await generationManager.resetProjectAssets(id).catch(() => {});
   const updated = await transact((transactionStore) => {
     const project = findProject(transactionStore, id);
     project.dish = selection.dish;
     project.analysis = selection.analysis;
     project.title = `${selection.dish.name} · ${getAudience(project.audience).shortLabel}`;
     project.storyboard = null;
+    project.generation = null;
     project.status = 'breakdown';
     project.activeStep = 3;
     project.planningNote = planningNote;
@@ -447,7 +497,6 @@ async function handleSelectDish(req, res, id) {
     project.render = { status: 'not-submitted', jobs: [] };
     return project;
   });
-
   sendJson(res, 200, { project: serializeProject(updated) });
 }
 
@@ -469,6 +518,7 @@ async function handleAnalyze(req, res) {
 
 async function handleStoryboard(req, res, id) {
   const body = await readJson(req);
+  await generationManager.resetProjectAssets(id).catch(() => {});
   const project = await transact((store) => {
     const target = findProject(store, id);
     if (!target.dish) throw new HttpError(409, 'dish_missing', 'Select a dish first');
@@ -477,6 +527,7 @@ async function handleStoryboard(req, res, id) {
       ? Math.max(0, Math.floor(requestedSeed))
       : target.storyboard?.variantSeed ?? target.rerolls ?? 0;
     target.storyboard = buildStoryboard({ project: target, variantSeed });
+    target.generation = null;
     target.status = 'storyboard';
     target.activeStep = 4;
     target.storyboardReadyAt = nowIso();
@@ -552,7 +603,7 @@ async function handleExport(req, res, id, url) {
   const store = await readStore();
   const project = findProject(store, id);
   ensureStoryboard(project);
-  const bundle = buildExport(project, format);
+  const bundle = await buildExport(project, format);
   res.writeHead(200, {
     ...baseHeaders(bundle.contentType),
     'Content-Disposition': `attachment; filename="${bundle.filename}"`,
@@ -693,6 +744,282 @@ async function handleSettings(req, res) {
   sendJson(res, 200, { settings });
 }
 
+async function handleFlowStatus(req, res) {
+  sendJson(res, 200, { flow: await flowSession.describe() });
+}
+
+async function handleFlowConnect(req, res) {
+  const body = await readJson(req);
+  const flow = await flowSession.connect({ consent: body.consent === true });
+  sendJson(res, 202, { flow });
+}
+
+async function handleFlowDisconnect(req, res) {
+  const body = await readJson(req);
+  const flow = await flowSession.disconnect({ clearProfile: body.clearProfile === true });
+  sendJson(res, 200, { flow });
+}
+
+async function handleFlowPause(req, res) {
+  const body = await readJson(req);
+  const flow = await flowSession.pause(
+    cleanText(body.reason || 'Paused by you. Resolve anything in the Flow window, then resume.', 500),
+  );
+  sendJson(res, 200, { flow });
+}
+
+async function handleFlowResume(req, res) {
+  const flow = await flowSession.resume();
+  sendJson(res, 200, { flow });
+}
+
+async function handleFlowFocus(req, res) {
+  const flow = await flowSession.focus();
+  sendJson(res, 200, { flow });
+}
+
+async function handleFlowDiagnostics(req, res) {
+  const diagnostics = await flowSession.captureDiagnostics();
+  sendJson(res, 200, { diagnostics, flow: await flowSession.describe() });
+}
+
+async function handleFlowScreenshot(req, res) {
+  const file = flowSession.screenshotPath();
+  if (!file) throw new HttpError(404, 'screenshot_not_found', 'No Flow screenshot has been captured yet');
+  let data;
+  try {
+    data = await fs.readFile(file);
+  } catch {
+    throw new HttpError(404, 'screenshot_not_found', 'No Flow screenshot has been captured yet');
+  }
+  res.writeHead(200, {
+    ...baseHeaders('image/png'),
+    'Cache-Control': 'no-store',
+    'Content-Length': data.length,
+  });
+  res.end(data);
+}
+
+async function writeUploadToTemp(req, tempPath) {
+  const declared = Number(req.headers['content-length'] ?? 0);
+  if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+    throw new HttpError(
+      413,
+      'payload_too_large',
+      `Upload is larger than the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit`,
+    );
+  }
+  let size = 0;
+  const limiter = new Transform({
+    transform(chunk, encoding, callback) {
+      size += chunk.length;
+      if (size > MAX_UPLOAD_BYTES) {
+        callback(
+          new HttpError(
+            413,
+            'payload_too_large',
+            `Upload is larger than the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit`,
+          ),
+        );
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  try {
+    await pipeline(req, limiter, createWriteStream(tempPath, { flags: 'wx' }));
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => {});
+    throw error;
+  }
+  if (size === 0) {
+    await fs.unlink(tempPath).catch(() => {});
+    throw new HttpError(400, 'empty_upload', 'Upload a non-empty image or video file');
+  }
+  return size;
+}
+
+function stageByOneBasedIndex(project, index) {
+  const storyboard = ensureStoryboard(project);
+  const stage = storyboard.stages[index];
+  if (!stage) {
+    throw new HttpError(404, 'stage_not_found', `Stage ${index + 1} does not exist`);
+  }
+  return stage;
+}
+
+async function handleImportAsset(req, res, projectId, stageIndex, url) {
+  const kind = String(url.searchParams.get('kind') || '').toLowerCase();
+  if (kind !== 'image' && kind !== 'clip') {
+    throw new HttpError(400, 'invalid_asset_kind', 'kind must be image or clip');
+  }
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  const stage = stageByOneBasedIndex(project, stageIndex);
+  const tempPath = await createUploadTempPath(path.extname(url.searchParams.get('filename') || ''));
+  await writeUploadToTemp(req, tempPath);
+  let updated;
+  try {
+    updated = await generationManager.importAsset(projectId, stage.id, kind, tempPath, {
+      mimeType: String(req.headers['content-type'] || ''),
+      approved: url.searchParams.get('approve') === '1' ? true : null,
+    });
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => {});
+    throw error;
+  }
+  sendJson(res, 201, { project: serializeProject(updated) });
+}
+
+async function handleGenerate(req, res, projectId, kind) {
+  const body = await readJson(req);
+  const result = await generationManager.start(projectId, kind, {
+    stageIds: Array.isArray(body.stageIds) ? body.stageIds : [],
+    autoApprove: body.autoApprove === true,
+  });
+  sendJson(res, 202, {
+    queued: true,
+    project: result.project,
+    generation: result.project.generation,
+  });
+}
+
+async function handleGenerationStatus(req, res, projectId) {
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  const serialized = serializeProject(project);
+  sendJson(res, 200, {
+    generation: serialized.generation ?? null,
+    flow: await flowSession.describe(),
+  });
+}
+
+async function handleCancelGeneration(req, res, projectId) {
+  await generationManager.cancel(projectId);
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  sendJson(res, 202, { project: serializeProject(project) });
+}
+
+async function handleAssetUpdate(req, res, projectId, stageIndex, assetId) {
+  const body = await readJson(req);
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  const stage = stageByOneBasedIndex(project, stageIndex);
+  const updated = await generationManager.setAssetApproval(
+    projectId,
+    stage.id,
+    decodeURIComponent(assetId),
+    body.approved !== false,
+  );
+  sendJson(res, 200, { project: serializeProject(updated) });
+}
+
+async function handleAssetDelete(req, res, projectId, stageIndex, assetId) {
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  const stage = stageByOneBasedIndex(project, stageIndex);
+  const updated = await generationManager.deleteAsset(projectId, stage.id, decodeURIComponent(assetId));
+  sendJson(res, 200, { project: serializeProject(updated) });
+}
+
+async function handleApproveImages(req, res, projectId) {
+  const body = await readJson(req);
+  const updated = await generationManager.approveLatestImages(projectId, {
+    stageIds: Array.isArray(body.stageIds) ? body.stageIds : [],
+    approved: body.approved !== false,
+  });
+  sendJson(res, 200, { project: serializeProject(updated) });
+}
+
+async function handleMedia(req, res, projectId, stageId, filename, url) {
+  const store = await readStore();
+  const project = findProject(store, projectId);
+  const stage = ensureStoryboard(project).stages.find(
+    (item) => item.id.toLowerCase() === String(stageId).toLowerCase(),
+  );
+  if (!stage) throw new HttpError(404, 'stage_not_found', 'Stage not found');
+  const stageGeneration = project.generation?.stages?.[stage.id];
+  const asset = [...(stageGeneration?.images ?? []), ...(stageGeneration?.clips ?? [])].find(
+    (item) => item.file === filename,
+  );
+  if (!asset || !isAllowedMediaFile(filename)) {
+    throw new HttpError(404, 'asset_not_found', 'Media asset not found');
+  }
+
+  const filePath = assetFilePath(projectId, stage.id, filename);
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    throw new HttpError(404, 'asset_file_missing', 'Media file is missing from local storage');
+  }
+  if (!stat.isFile()) throw new HttpError(404, 'asset_file_missing', 'Media file is missing');
+
+  const contentType = mediaContentType(filename);
+  const download = url.searchParams.get('download') === '1';
+  const headers = {
+    ...baseHeaders(contentType),
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=31536000, immutable',
+  };
+  if (download) {
+    const extension = path.extname(filename);
+    headers['Content-Disposition'] = `attachment; filename="${stage.id}-${asset.kind}${extension}"`;
+  }
+
+  const range = req.headers.range;
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+    if (!match) {
+      res.writeHead(416, {
+        ...baseHeaders(contentType),
+        'Content-Range': `bytes */${stat.size}`,
+      });
+      res.end();
+      return;
+    }
+    let start = match[1] === '' ? null : Number(match[1]);
+    let end = match[2] === '' ? null : Number(match[2]);
+    if (start === null) {
+      const suffix = end ?? 0;
+      start = Math.max(0, stat.size - suffix);
+      end = stat.size - 1;
+    } else {
+      end = end === null ? stat.size - 1 : Math.min(end, stat.size - 1);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
+      res.writeHead(416, {
+        ...baseHeaders(contentType),
+        'Content-Range': `bytes */${stat.size}`,
+      });
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      ...headers,
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Content-Length': end - start + 1,
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    await pipeline(createReadStream(filePath, { start, end }), res).catch(() => {});
+    return;
+  }
+
+  res.writeHead(200, {
+    ...headers,
+    'Content-Length': stat.size,
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  await pipeline(createReadStream(filePath), res).catch(() => {});
+}
+
 async function route(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
@@ -711,6 +1038,7 @@ async function route(req, res) {
       time: nowIso(),
       renderConfigured: getRenderConfig().configured,
       aiConfigured: getAiStatus().configured,
+      flowMode: flowSession.mode,
     });
     return;
   }
@@ -727,6 +1055,46 @@ async function route(req, res) {
 
   if (pathname === '/api/settings' && (method === 'GET' || method === 'PATCH')) {
     await handleSettings(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/status' && method === 'GET') {
+    await handleFlowStatus(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/connect' && method === 'POST') {
+    await handleFlowConnect(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/disconnect' && method === 'POST') {
+    await handleFlowDisconnect(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/pause' && method === 'POST') {
+    await handleFlowPause(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/resume' && method === 'POST') {
+    await handleFlowResume(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/focus' && method === 'POST') {
+    await handleFlowFocus(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/diagnostics' && method === 'POST') {
+    await handleFlowDiagnostics(req, res);
+    return;
+  }
+
+  if (pathname === '/api/flow/screenshot' && (method === 'GET' || method === 'HEAD')) {
+    await handleFlowScreenshot(req, res);
     return;
   }
 
@@ -767,6 +1135,86 @@ async function route(req, res) {
       return;
     }
     throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+  }
+
+  const generateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/generate\/(images|clips)$/);
+  if (generateMatch) {
+    if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    await handleGenerate(
+      req,
+      res,
+      decodeURIComponent(generateMatch[1]),
+      generateMatch[2],
+    );
+    return;
+  }
+
+  const cancelGenerationMatch = pathname.match(/^\/api\/projects\/([^/]+)\/generate\/cancel$/);
+  if (cancelGenerationMatch) {
+    if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    await handleCancelGeneration(req, res, decodeURIComponent(cancelGenerationMatch[1]));
+    return;
+  }
+
+  const generationMatch = pathname.match(/^\/api\/projects\/([^/]+)\/generation$/);
+  if (generationMatch) {
+    if (method !== 'GET') throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    await handleGenerationStatus(req, res, decodeURIComponent(generationMatch[1]));
+    return;
+  }
+
+  const approveImagesMatch = pathname.match(/^\/api\/projects\/([^/]+)\/approve-images$/);
+  if (approveImagesMatch) {
+    if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    await handleApproveImages(req, res, decodeURIComponent(approveImagesMatch[1]));
+    return;
+  }
+
+  const importAssetMatch = pathname.match(/^\/api\/projects\/([^/]+)\/stages\/(\d+)\/assets$/);
+  if (importAssetMatch) {
+    if (method !== 'POST') throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    await handleImportAsset(
+      req,
+      res,
+      decodeURIComponent(importAssetMatch[1]),
+      Number(importAssetMatch[2]) - 1,
+      url,
+    );
+    return;
+  }
+
+  const assetMatch = pathname.match(
+    /^\/api\/projects\/([^/]+)\/stages\/(\d+)\/assets\/([^/]+)$/,
+  );
+  if (assetMatch) {
+    const projectId = decodeURIComponent(assetMatch[1]);
+    const stageIndex = Number(assetMatch[2]) - 1;
+    const assetId = assetMatch[3];
+    if (method === 'PATCH') {
+      await handleAssetUpdate(req, res, projectId, stageIndex, assetId);
+      return;
+    }
+    if (method === 'DELETE') {
+      await handleAssetDelete(req, res, projectId, stageIndex, assetId);
+      return;
+    }
+    throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+  }
+
+  const mediaMatch = pathname.match(/^\/api\/projects\/([^/]+)\/media\/([^/]+)\/([^/]+)$/);
+  if (mediaMatch) {
+    if (method !== 'GET' && method !== 'HEAD') {
+      throw new HttpError(405, 'method_not_allowed', 'Method not allowed');
+    }
+    await handleMedia(
+      req,
+      res,
+      decodeURIComponent(mediaMatch[1]),
+      decodeURIComponent(mediaMatch[2]),
+      decodeURIComponent(mediaMatch[3]),
+      url,
+    );
+    return;
   }
 
   const selectMatch = pathname.match(/^\/api\/projects\/([^/]+)\/select$/);
@@ -836,7 +1284,10 @@ export async function handleRequest(req, res) {
       res.destroy();
       return;
     }
-    if (!(error instanceof HttpError)) {
+    // Expected client/domain errors (4xx) are part of normal operation; only
+    // log unexpected failures so the console stays useful.
+    const statusCode = Number(error?.statusCode) || 500;
+    if (statusCode >= 500) {
       console.error('[VidMo]', error);
     }
     sendError(res, error);

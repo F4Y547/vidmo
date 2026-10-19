@@ -301,15 +301,22 @@ shot-list.csv                 Spreadsheet-ready shot list with full prompts
 social-copy.md                Titles, hooks, captions and hashtags
 thumbnail-prompt.txt          Cover / thumbnail prompt
 render-handoff.json           Model-agnostic render manifest
+flow/board.html               Clickable Google Flow board (opens in any browser)
+flow/manifest.json            Flow image/video jobs with approved media paths
+flow/shot-list.csv            Flow shot list for approval tracking
+flow/README.md                Flow pack instructions and credit notes
+flow/import-back.md           How to import manual Flow downloads into VidMo
+flow/prompts/                 S0X-image.txt and S0X-video.txt per stage
+media/stage-XX/               Generated or uploaded images and clips (when present)
 stage-XX-image.txt            Image prompt for each stage
 stage-XX-motion.txt           Motion prompt with ASMR lock
 stage-XX-audio.txt            Audio prompt (ASMR only)
 
 WORKFLOW
 --------
-1. Generate all stage images from the image prompts, keeping the same reference seed.
-2. Approve the final plating frame before generating motion.
-3. Generate each motion clip from its stage image and motion prompt.
+1. Generate stage images from the image prompts, keeping the same reference seed. Inside VidMo this runs in Google Flow with your own signed-in account; the flow/ folder is the manual fallback.
+2. Review and approve one image take per stage before generating any motion — approved images are the start frames for image-to-video.
+3. Generate each motion clip from its approved stage image and motion prompt.
 4. Edit with the stage audio prompts only. No music, no voiceover, no dialogue.
 5. Export a 1080x1920 vertical master.
 

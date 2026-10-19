@@ -243,8 +243,14 @@ export function buildSocialPack(audienceId, dish) {
 export function buildProductionNotes(audienceId, dish) {
   const audience = getAudience(audienceId);
   return {
-    imageModels: ['Midjourney v7', 'FLUX 1.1 Pro', 'Google Imagen 4', 'GPT Image'],
+    imageModels: ['Google Flow', 'Midjourney v7', 'FLUX 1.1 Pro', 'GPT Image'],
     videoModels: [
+      {
+        name: 'Google Flow (Veo)',
+        mode: 'Image-to-video',
+        clip: '8s',
+        note: 'Built into VidMo: sign in to your own Flow account, generate stage images first, approve them, then animate each approved image. Attach the stage image as the start frame, paste the motion prompt, keep 9:16 and explicit ASMR audio. Flow clips run ~8s per shot; trim to the stage duration in the edit.',
+      },
       {
         name: 'Google Veo 3.1',
         mode: 'Image-to-video + native audio',
@@ -271,9 +277,9 @@ export function buildProductionNotes(audienceId, dish) {
       },
     ],
     workflow: [
-      `Generate all ${dish.stages.length} stage images first, using the same reference seed and the continuity bible.`,
-      'Approve the final plating frame before generating any motion. It defines the visual target for the edit.',
-      'Generate video stage by stage. Use each previous stage’s last frame as the next image reference where the tool supports it.',
+      `Generate all ${dish.stages.length} stage images first from the locked image prompts, using the same reference seed and the continuity bible. In VidMo + Google Flow this is the "Generate all images" step on the storyboard.`,
+      'Review every image on the storyboard and approve one take per stage. Approved images are the start frames Flow animates — clips stay locked until the image is approved.',
+      'Generate video stage by stage from the approved images. Use each previous stage’s last frame as the next image reference where the tool supports it.',
       'Build the ASMR edit from the stage audio prompts, matching every sound to visible action. No music bed.',
       'Add silent text hooks in the edit if needed. Do not add voiceover or dialogue.',
       `Export ${audience.aspect} masters at 1080×1920 and a 4:5 or 1:1 cutdown for feed placements.`,

@@ -1,16 +1,8 @@
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..', '..');
-const DATA_DIR = process.env.VIDMO_DATA_DIR
-  ? path.resolve(process.env.VIDMO_DATA_DIR)
-  : path.join(ROOT, 'data');
-const STORE_FILE = path.join(DATA_DIR, 'store.json');
+import { DATA_DIR, STORE_FILE } from './paths.js';
 
 const DEFAULT_STORE = {
-  version: 1,
+  version: 2,
   settings: {
     defaultVideoModel: 'Google Veo 3.1',
   },
@@ -44,11 +36,39 @@ async function readStoreFile() {
   }
 }
 
+// Windows can briefly lock the store file (antivirus, indexer, another local
+// process), which surfaces as a transient rename failure. Retry those instead
+// of failing a generation job over a momentary lock.
+const TRANSIENT_RENAME_ERRORS = new Set(['EPERM', 'EBUSY', 'EACCES']);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function renameWithRetry(source, target, attempts = 6) {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await fs.rename(source, target);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!TRANSIENT_RENAME_ERRORS.has(error?.code)) throw error;
+      await sleep(25 * 2 ** attempt);
+    }
+  }
+  throw lastError;
+}
+
 async function writeStoreFile(store) {
   await ensureStore();
   const temp = `${STORE_FILE}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(temp, JSON.stringify(store, null, 2), 'utf8');
-  await fs.rename(temp, STORE_FILE);
+  try {
+    await fs.writeFile(temp, JSON.stringify(store, null, 2), 'utf8');
+    await renameWithRetry(temp, STORE_FILE);
+  } finally {
+    await fs.rm(temp, { force: true }).catch(() => {});
+  }
 }
 
 export async function readStore() {

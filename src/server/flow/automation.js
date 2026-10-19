@@ -1,0 +1,603 @@
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { FlowAutomationError, FlowError } from './errors.js';
+import {
+  clickFirst,
+  detectBlockingText,
+  findFirst,
+  loadSelectors,
+  modelLabel,
+  visibleText,
+} from './selectors.js';
+
+const IMAGE_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_IMAGE_TIMEOUT_MS || 8 * 60 * 1000);
+const VIDEO_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_VIDEO_TIMEOUT_MS || 25 * 60 * 1000);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function abortError() {
+  const error = new Error('Generation cancelled');
+  error.name = 'AbortError';
+  error.code = 'generation_cancelled';
+  return error;
+}
+
+function checkAbort(signal) {
+  if (signal?.aborted) throw abortError();
+}
+
+async function diagnostics(session, label) {
+  await session.screenshot({ label }).catch(() => {});
+  await session.captureDiagnostics().catch(() => {});
+}
+
+async function setPrompt(page, prompt, signal) {
+  const selectors = await loadSelectors();
+  const field = await findFirst(page, selectors.prompt, { timeout: 15_000 });
+  if (!field) {
+    throw new FlowAutomationError(
+      'The Flow prompt field was not found. Open Flow, capture diagnostics, and check the selector map.',
+      { step: 'prompt' },
+    );
+  }
+  checkAbort(signal);
+  await field.click({ timeout: 8000 }).catch(() => {});
+  await page.keyboard.press('Control+A').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
+  let filled = false;
+  try {
+    await field.fill(prompt, { timeout: 15_000 });
+    filled = true;
+  } catch {
+    filled = false;
+  }
+  if (!filled) {
+    await field.click({ timeout: 8000 }).catch(() => {});
+    await page.keyboard.insertText(prompt);
+  }
+  const actual = await field
+    .evaluate((element) => {
+      if ('value' in element && typeof element.value === 'string') return element.value;
+      return element.innerText ?? element.textContent ?? '';
+    })
+    .catch(() => '');
+  const normalized = String(actual ?? '').trim();
+  if (normalized.length < Math.min(40, prompt.length * 0.5)) {
+    throw new FlowAutomationError(
+      'The Flow prompt field did not accept the full prompt. This usually means Flow changed its editor. Capture diagnostics and retry.',
+      { step: 'prompt', expected: prompt.length, actual: normalized.length },
+    );
+  }
+  return normalized.length;
+}
+
+async function chooseMenuOption(page, selectors, label, { required = false } = {}) {
+  const option = await findFirst(page, selectors, { timeout: 2500 });
+  if (!option) {
+    if (required) {
+      throw new FlowAutomationError(
+        `Could not find the ${label} option in Flow. Capture diagnostics so the selector map can be updated.`,
+        { step: label },
+      );
+    }
+    return false;
+  }
+  await option.click({ timeout: 6000 });
+  await sleep(500);
+  return true;
+}
+
+async function chooseNamedModel(page, name, signal) {
+  const selectors = await loadSelectors();
+  const modelButton = await findFirst(page, selectors.model, { timeout: 2000 });
+  if (!modelButton) return false;
+  await modelButton.click({ timeout: 5000 }).catch(() => {});
+  await sleep(350);
+  const option = page.getByText(name, { exact: false }).last();
+  if (await option.isVisible({ timeout: 2500 }).catch(() => false)) {
+    checkAbort(signal);
+    await option.click({ timeout: 5000 });
+    await sleep(500);
+    return true;
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+  return false;
+}
+
+async function selectMode(page, mode, { signal, onProgress } = {}) {
+  const selectors = await loadSelectors();
+  const current = await modelLabel(page);
+  const currentLooksVideo = /video|veo|omni|frames/i.test(current);
+  const currentLooksImage = /image|nano banana|imagen/i.test(current);
+
+  if (mode === 'image' && (currentLooksImage || !current)) {
+    return { mode: 'image', label: current, warning: null };
+  }
+  if (mode === 'video' && currentLooksVideo) {
+    // Some Flow builds expose Frames as a separate mode after Video.
+    const frames = await findFirst(page, selectors.framesOption, { timeout: 700 });
+    if (frames) await frames.click({ timeout: 5000 }).catch(() => {});
+    return { mode: 'video', label: current, warning: null };
+  }
+
+  onProgress?.(mode === 'video' ? 'Switching Flow to video mode…' : 'Switching Flow to image mode…');
+  const modelButton = await findFirst(page, selectors.model, { timeout: 4000 });
+  if (!modelButton) {
+    if (mode === 'image') {
+      return {
+        mode: 'image',
+        label: current,
+        warning: 'Could not find a Flow model selector. Using Flow’s default image mode.',
+      };
+    }
+    throw new FlowAutomationError(
+      'Could not find the Flow model selector to switch to video. Capture diagnostics and check the selector map.',
+      { step: 'model' },
+    );
+  }
+  await modelButton.click({ timeout: 8000 });
+  await sleep(500);
+  const options = mode === 'video' ? selectors.videoOption : selectors.imageOption;
+  const selected = await chooseMenuOption(page, options, mode, { required: mode === 'video' });
+  if (!selected && mode === 'image') {
+    await page.keyboard.press('Escape').catch(() => {});
+    return { mode: 'image', label: current, warning: 'Could not switch Flow back to image mode.' };
+  }
+
+  if (mode === 'video') {
+    const configuredModel = process.env.VIDMO_FLOW_VIDEO_MODEL;
+    if (configuredModel) {
+      const named = await chooseNamedModel(page, configuredModel, signal);
+      if (!named) {
+        onProgress?.(`Video model "${configuredModel}" was not found; using Flow’s default.`);
+      }
+    }
+    const frames = await findFirst(page, selectors.framesOption, { timeout: 1200 });
+    if (frames) await frames.click({ timeout: 5000 }).catch(() => {});
+  } else if (process.env.VIDMO_FLOW_IMAGE_MODEL) {
+    await chooseNamedModel(page, process.env.VIDMO_FLOW_IMAGE_MODEL, signal);
+  }
+
+  await sleep(500);
+  const label = await modelLabel(page);
+  if (mode === 'video' && !/video|veo|omni|frames/i.test(label)) {
+    const addStart = await findFirst(page, selectors.addStartFrame, { timeout: 2000 });
+    if (!addStart) {
+      throw new FlowAutomationError(
+        'Flow did not switch to video mode. Capture diagnostics so the video-mode selectors can be updated.',
+        { step: 'video-mode', modelLabel: label },
+      );
+    }
+  }
+  return { mode, label: label || current, warning: null };
+}
+
+async function setAspectRatio(page, { signal } = {}) {
+  const selectors = await loadSelectors();
+  checkAbort(signal);
+  const visibleAspect = await findFirst(
+    page,
+    ['button:has-text("9:16")', '[role="button"]:has-text("9:16")'],
+    { timeout: 700 },
+  );
+  if (visibleAspect) {
+    const text = (await visibleAspect.innerText().catch(() => '')).trim();
+    if (/9\s*:\s*16/i.test(text)) return { applied: true, warning: null };
+  }
+  const control = await findFirst(
+    page,
+    [
+      'button:has-text("16:9")',
+      'button[aria-label*="aspect" i]',
+      '[role="button"][aria-label*="aspect" i]',
+      ...selectors.aspect,
+    ],
+    { timeout: 900 },
+  );
+  if (!control) {
+    return {
+      applied: false,
+      warning:
+        'Flow’s 9:16 aspect control was not found. The prompts still specify vertical 9:16, but check the output ratio.',
+    };
+  }
+  await control.click({ timeout: 5000 }).catch(() => {});
+  await sleep(400);
+  const option = await findFirst(
+    page,
+    [
+      '[role="menuitem"]:has-text("9:16")',
+      '[role="option"]:has-text("9:16")',
+      'button:has-text("9:16")',
+      'text=/9\\s*:\\s*16/',
+    ],
+    { timeout: 2000 },
+  );
+  if (option) {
+    await option.click({ timeout: 5000 }).catch(() => {});
+    await sleep(300);
+    return { applied: true, warning: null };
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+  return {
+    applied: false,
+    warning:
+      'The 9:16 option did not appear after opening Flow’s aspect menu. Confirm the output is vertical.',
+  };
+}
+
+async function attachStartFrame(page, imagePath, { signal, session } = {}) {
+  const selectors = await loadSelectors();
+  checkAbort(signal);
+  let fileInput = await findFirst(page, ['input[type="file"]'], { timeout: 700, visible: false });
+  const addStart = await findFirst(page, selectors.addStartFrame, { timeout: 2500 });
+
+  if (addStart) {
+    const chooserPromise = page
+      .waitForEvent('filechooser', { timeout: 6000 })
+      .catch(() => null);
+    await addStart.click({ timeout: 6000 }).catch(() => {});
+    const chooser = await chooserPromise;
+    if (chooser) {
+      await chooser.setFiles(imagePath);
+    } else if (!fileInput) {
+      fileInput = await findFirst(page, ['input[type="file"]'], { timeout: 2500, visible: false });
+      if (fileInput) await fileInput.setInputFiles(imagePath);
+    }
+  }
+
+  if (!fileInput) {
+    fileInput = await findFirst(
+      page,
+      ['input[type="file"][accept*="image"]', 'input[type="file"]'],
+      { timeout: 2500, visible: false },
+    );
+  }
+  if (!fileInput) {
+    throw new FlowAutomationError(
+      'Could not find Flow’s start-frame upload control. Capture diagnostics so the video selector map can be updated.',
+      { step: 'start-frame' },
+    );
+  }
+  if (addStart && fileInput) {
+    // The chooser may already have consumed the file; setting it again is harmless
+    // for Flow's hidden input and makes this path work across Flow builds.
+    await fileInput.setInputFiles(imagePath).catch(() => {});
+  } else {
+    await fileInput.setInputFiles(imagePath);
+  }
+
+  // Wait for the upload to settle. Flow shows a thumbnail or an "Uploading" label.
+  const started = Date.now();
+  while (Date.now() - started < 45_000) {
+    checkAbort(signal);
+    const text = await visibleText(page, 3000);
+    const blocked = detectBlockingText(text);
+    if (blocked && ['captcha', 'credits', 'terms', 'signin'].includes(blocked.kind)) {
+      await session.waitForManual(blocked.message, { signal });
+      continue;
+    }
+    if (!/uploading|processing image|preparing/i.test(text)) break;
+    await sleep(1200);
+  }
+  return path.basename(imagePath);
+}
+
+async function clickGenerate(page, { signal } = {}) {
+  const selectors = await loadSelectors();
+  checkAbort(signal);
+  const button = await findFirst(page, selectors.generate, { timeout: 8000 });
+  if (!button) {
+    throw new FlowAutomationError(
+      'Could not find Flow’s Generate button. Capture diagnostics so the selector map can be updated.',
+      { step: 'generate' },
+    );
+  }
+  const disabled = await button.isDisabled().catch(() => false);
+  if (disabled) {
+    throw new FlowAutomationError(
+      'Flow’s Generate button is disabled. Make sure a prompt is present and the account has credits.',
+      { step: 'generate' },
+    );
+  }
+  await button.click({ timeout: 10_000 });
+}
+
+async function mediaCandidates(page, kind) {
+  return page.evaluate((requestedKind) => {
+    const selector = requestedKind === 'clip' ? 'video' : 'img';
+    return [...document.querySelectorAll(selector)]
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const src = element.currentSrc || element.src || element.querySelector('source')?.src || '';
+        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+        const visible =
+          rect.width > 40 &&
+          rect.height > 40 &&
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          Number(style.opacity || 1) > 0.05;
+        return {
+          src,
+          key: `${src}|${Math.round(rect.width)}x${Math.round(rect.height)}|${element.getAttribute('poster') ?? ''}`,
+          area: Math.round(area),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          naturalWidth: element.naturalWidth || element.videoWidth || 0,
+          naturalHeight: element.naturalHeight || element.videoHeight || 0,
+          duration: Number.isFinite(element.duration) ? element.duration : null,
+          readyState: element.readyState ?? null,
+          visible,
+          alt: element.getAttribute('alt') ?? '',
+          poster: element.getAttribute('poster') ?? '',
+        };
+      })
+      .filter((item) => item.visible && item.src && item.area > 20_000)
+      .sort((a, b) => b.area - a.area)
+      .slice(0, 20);
+  }, kind);
+}
+
+async function mediaSignature(page, kind) {
+  const candidates = await mediaCandidates(page, kind);
+  return new Set(candidates.map((item) => item.key));
+}
+
+async function isLoading(page) {
+  const selectors = await loadSelectors();
+  const busy = await findFirst(page, selectors.busy, { timeout: 500 });
+  if (!busy) return false;
+  const text = (await busy.innerText().catch(() => '')).trim();
+  // "Generate" is not a loading label; only trust status language.
+  return /generating|creating|rendering|processing|queued/i.test(text) || /true/i.test(await busy.getAttribute('aria-busy').catch(() => ''));
+}
+
+async function waitForResult(page, kind, before, { signal, session, onProgress } = {}) {
+  const selectors = await loadSelectors();
+  const timeout = kind === 'clip' ? VIDEO_TIMEOUT_MS : IMAGE_TIMEOUT_MS;
+  const started = Date.now();
+  let stableKey = null;
+  let stableSince = 0;
+  let failureHits = 0;
+  let sawResult = false;
+
+  while (Date.now() - started < timeout) {
+    checkAbort(signal);
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    const text = await visibleText(page, 5000);
+    const blocked = detectBlockingText(text);
+    if (blocked) {
+      if (blocked.kind === 'failure') {
+        failureHits += 1;
+        if (failureHits >= 3) {
+          await diagnostics(session, `${kind}-failure`);
+          throw new FlowAutomationError(blocked.message, {
+            step: 'generation',
+            kind,
+            flowText: text.slice(0, 1200),
+          });
+        }
+      } else {
+        failureHits = 0;
+        await session.waitForManual(blocked.message, { signal, onWait: onProgress });
+        continue;
+      }
+    } else {
+      failureHits = 0;
+    }
+
+    const candidates = await mediaCandidates(page, kind);
+    const fresh = candidates.find((item) => !before.has(item.key));
+    if (fresh) {
+      sawResult = true;
+      if (fresh.key !== stableKey) {
+        stableKey = fresh.key;
+        stableSince = Date.now();
+      }
+      const busy = await isLoading(page);
+      const settledFor = Date.now() - stableSince;
+      const structurallyReady =
+        kind === 'clip'
+          ? fresh.readyState === null || fresh.readyState >= 1 || Boolean(fresh.poster)
+          : fresh.naturalWidth > 0 || fresh.width > 160;
+      if (!busy || settledFor > 8000) {
+        if (structurallyReady || settledFor > 4000) {
+          onProgress?.(`Flow ${kind === 'clip' ? 'video' : 'image'} ready — saving locally…`);
+          await sleep(kind === 'clip' ? 1800 : 900);
+          checkAbort(signal);
+          const after = await mediaCandidates(page, kind);
+          return after.find((item) => item.key === fresh.key) ?? fresh;
+        }
+      }
+    }
+
+    onProgress?.(
+      `Flow is generating stage ${kind === 'clip' ? 'video' : 'image'}… ${elapsed}s`,
+    );
+    await sleep(2500);
+  }
+
+  await diagnostics(session, `${kind}-timeout`);
+  throw new FlowAutomationError(
+    sawResult
+      ? `Flow produced a ${kind} preview but it never settled into a downloadable asset.`
+      : `Timed out after ${Math.round(timeout / 1000)}s waiting for Flow to finish the ${kind}.`,
+    { step: 'generation-timeout', kind, timeoutMs: timeout },
+  );
+}
+
+function base64ToBuffer(base64) {
+  return Buffer.from(String(base64).replace(/^data:[^,]*,/, ''), 'base64');
+}
+
+async function fetchMediaSource(page, src) {
+  if (!src) return null;
+  if (src.startsWith('data:')) {
+    const match = src.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+    if (!match) return null;
+    if (match[2]) {
+      return { buffer: base64ToBuffer(match[3]), mimeType: match[1] || 'application/octet-stream' };
+    }
+    return {
+      buffer: Buffer.from(decodeURIComponent(match[3]), 'utf8'),
+      mimeType: match[1] || 'application/octet-stream',
+    };
+  }
+
+  if (!src.startsWith('blob:')) {
+    try {
+      const response = await page.context().request.get(src, { timeout: 60_000 });
+      if (response.ok()) {
+        return {
+          buffer: Buffer.from(await response.body()),
+          mimeType: response.headers()['content-type'] || '',
+        };
+      }
+    } catch {
+      /* fall through to in-page fetch */
+    }
+  }
+
+  const payload = await page.evaluate(async (url) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Media fetch failed: ${response.status}`);
+    const blob = await response.blob();
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error || new Error('Could not read media blob'));
+      reader.readAsDataURL(blob);
+    });
+    return { dataUrl, mimeType: blob.type || '' };
+  }, src);
+  return {
+    buffer: base64ToBuffer(payload.dataUrl),
+    mimeType: payload.mimeType,
+  };
+}
+
+async function downloadFallback(page, kind, session) {
+  const selectors = await loadSelectors();
+  const buttons = page.locator(selectors.download.join(', '));
+  const count = await buttons.count().catch(() => 0);
+  if (!count) return null;
+  for (let index = count - 1; index >= Math.max(0, count - 4); index -= 1) {
+    const button = buttons.nth(index);
+    if (!(await button.isVisible().catch(() => false))) continue;
+    const downloadPromise = page.waitForEvent('download', { timeout: 15_000 }).catch(() => null);
+    await button.click({ timeout: 6000 }).catch(() => {});
+    const download = await downloadPromise;
+    if (!download) continue;
+    const filePath = await download.path();
+    if (!filePath) continue;
+    const buffer = await fs.readFile(filePath);
+    if (!buffer.length) continue;
+    return {
+      buffer,
+      mimeType: kind === 'clip' ? 'video/mp4' : 'image/png',
+      source: 'download-button',
+    };
+  }
+  await diagnostics(session, `download-${kind}`);
+  return null;
+}
+
+async function captureCandidate(page, candidate, kind, { session } = {}) {
+  let media = null;
+  try {
+    media = await fetchMediaSource(page, candidate.src);
+  } catch {
+    media = null;
+  }
+  if (media?.buffer?.length) {
+    return { ...media, source: candidate.src.startsWith('blob:') ? 'blob' : 'media-src' };
+  }
+  const downloaded = await downloadFallback(page, kind, session);
+  if (downloaded) return downloaded;
+  throw new FlowAutomationError(
+    `Flow showed a new ${kind}, but VidMo could not read its bytes. Use the download button in Flow, then import the file into this stage.`,
+    { step: 'capture', kind },
+  );
+}
+
+/**
+ * Generate one image in Flow. The returned buffer is saved by the caller.
+ */
+export async function generateImage({
+  session,
+  prompt,
+  projectId,
+  projectTitle = '',
+  stageLabel = '',
+  signal,
+  onProgress,
+}) {
+  await session.ensureReady({ signal, onWait: onProgress });
+  return session.runExclusive(async () => {
+    const page = session.page;
+    await session.startProject(projectId, projectTitle);
+    const mode = await selectMode(page, 'image', { signal, onProgress });
+    const aspect = await setAspectRatio(page, { signal });
+    if (aspect.warning) onProgress?.(aspect.warning);
+    onProgress?.(`Writing the image prompt for ${stageLabel || 'this stage'}…`);
+    const length = await setPrompt(page, prompt, signal);
+    const before = await mediaSignature(page, 'image');
+    onProgress?.('Sending the image to Google Flow…');
+    await clickGenerate(page, { signal });
+    const candidate = await waitForResult(page, 'image', before, { signal, session, onProgress });
+    const media = await captureCandidate(page, candidate, 'image', { session });
+    return {
+      ...media,
+      promptLength: length,
+      mode: mode.mode,
+      modelLabel: mode.label,
+      aspectApplied: aspect.applied,
+      warnings: [mode.warning, aspect.warning].filter(Boolean),
+      flowPageUrl: page.url(),
+    };
+  });
+}
+
+/**
+ * Generate one image-to-video clip. The image is supplied as Flow's start frame.
+ */
+export async function generateVideo({
+  session,
+  prompt,
+  startImagePath,
+  projectId,
+  projectTitle = '',
+  stageLabel = '',
+  signal,
+  onProgress,
+}) {
+  await session.ensureReady({ signal, onWait: onProgress });
+  return session.runExclusive(async () => {
+    const page = session.page;
+    await session.startProject(projectId, projectTitle);
+    const mode = await selectMode(page, 'video', { signal, onProgress });
+    const aspect = await setAspectRatio(page, { signal });
+    if (aspect.warning) onProgress?.(aspect.warning);
+    onProgress?.(`Uploading the approved stage image for ${stageLabel || 'this stage'}…`);
+    await attachStartFrame(page, startImagePath, { signal, session });
+    onProgress?.('Writing the motion prompt…');
+    const length = await setPrompt(page, prompt, signal);
+    const before = await mediaSignature(page, 'clip');
+    onProgress?.('Sending the shot to Flow video generation…');
+    await clickGenerate(page, { signal });
+    const candidate = await waitForResult(page, 'clip', before, { signal, session, onProgress });
+    const media = await captureCandidate(page, candidate, 'clip', { session });
+    return {
+      ...media,
+      promptLength: length,
+      mode: mode.mode,
+      modelLabel: mode.label,
+      aspectApplied: aspect.applied,
+      warnings: [mode.warning, aspect.warning].filter(Boolean),
+      flowPageUrl: page.url(),
+    };
+  });
+}
