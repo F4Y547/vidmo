@@ -78,6 +78,7 @@ The storyboard step can drive image and image-to-video generation inside **your 
 
 Design constraints:
 
+- **Account requirements.** Flow images currently cost 0 credits; video is a paid Flow feature — at October 2026 pricing an 8s/720p clip costs **12 credits**, so clips need an active **Google AI Pro/Ultra** plan (or purchased Flow credits). Free, shared, resold or region-hopping accounts are frequently blocked by Flow's anti-abuse system with “We noticed some unusual activity”, sometimes on every generation. Use a personal account with a stable connection; if Google blocks it, resolve that with Google — VidMo cannot and will not bypass it.
 - **Google Flow has no public generation API.** VidMo automates the real signed-in web app in a visible browser window — no iframe embedding, no OAuth shortcuts, no private endpoints.
 - **Your credits, your account.** Flow generations consume Flow credits from your own Google account; VidMo does not include, resell or proxy credits.
 - **Nothing is bypassed.** If Flow shows a captcha, a credit warning, new terms or an unexpected UI, VidMo pauses generation, saves a screenshot and waits for you to resolve it in the Flow window, then Resume.

@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload menu when the start-frame tile does not open a file chooser directly.
 - The Flow panel no longer crashes on a missing stage generation record (TDZ
   shadowing) and no longer loses the selected tab during status polling.
+- Image confirmations now state that Flow images currently cost 0 credits, and
+  clip confirmations show the observed 12-credit cost for an 8s/720p clip.
+  Documentation and in-app copy explain that clips require a Google AI
+  Pro/Ultra plan (or purchased Flow credits) and that shared/free accounts are
+  frequently blocked by Flow's anti-abuse system.
 
 ## [1.1.0] — 2026-10-19
 

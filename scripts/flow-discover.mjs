@@ -19,7 +19,7 @@
  *   npm run flow:discover
  *   npm run flow:discover -- --exit            capture, then close immediately
  *   npm run flow:discover -- --timeout=15      wait up to 15 minutes for sign-in
- *   npm run flow:discover -- --url=https://labs.google/fx/tools/flow
+ *   npm run flow:discover -- --url=https://flow.google.com/
  */
 
 import { promises as fs } from 'node:fs';
@@ -67,7 +67,7 @@ async function main() {
   const { inspectFlowPage } = selectors;
 
   const flowUrl =
-    option('url', process.env.VIDMO_FLOW_URL || 'https://labs.google/fx/tools/flow');
+    option('url', process.env.VIDMO_FLOW_URL || 'https://flow.google.com/');
   const headless = hasFlag('headless') || process.env.VIDMO_FLOW_HEADLESS === '1';
   const keepOpen = !hasFlag('exit');
   const timeoutMinutes = Math.max(

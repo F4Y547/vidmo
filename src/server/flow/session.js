@@ -10,7 +10,7 @@ import {
 } from './errors.js';
 import { findFirst, inspectFlowPage, loadSelectors, visibleText } from './selectors.js';
 
-const FLOW_URL = process.env.VIDMO_FLOW_URL || 'https://labs.google/fx/tools/flow';
+const FLOW_URL = process.env.VIDMO_FLOW_URL || 'https://flow.google.com/';
 const LOGIN_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_LOGIN_TIMEOUT_MS || 10 * 60 * 1000);
 const ATTENTION_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_ATTENTION_TIMEOUT_MS || 30 * 60 * 1000);
 const DIAGNOSTICS_DIR = path.join(FLOW_DIR, 'diagnostics');

@@ -38,7 +38,7 @@ export function buildFlowManifest(project, assets = []) {
     generatedAt: new Date().toISOString(),
     projectId: project.id,
     title: project.title,
-    flowUrl: 'https://labs.google/fx/tools/flow',
+    flowUrl: 'https://flow.google.com/',
     aspect: storyboard.aspect,
     stages: storyboard.stages.map((stage, index) => {
       const stageAssets = byStage.get(stage.id) ?? [];
@@ -249,7 +249,7 @@ assets/                    Generated/imported media included with the ZIP
 
 MANUAL FLOW WORKFLOW
 --------------------
-1. Open https://labs.google/fx/tools/flow and sign in with your own account.
+1. Open https://flow.google.com/ and sign in with your own account.
 2. Create a new project and choose the image model (Nano Banana Pro or default).
 3. Set the aspect ratio to 9:16. Paste each stage image prompt and generate.
 4. Review every image against continuity-bible.md. Keep the same scale, hands,

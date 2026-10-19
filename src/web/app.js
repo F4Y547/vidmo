@@ -1154,7 +1154,7 @@ function flowPanelHtml(project) {
         <a class="btn btn-outline btn-sm" href="/api/projects/${esc(project.id)}/export?format=flow">Flow pack</a>
         <button class="btn btn-ghost btn-sm" type="button" data-action="focus-flow" ${flow.connected ? '' : 'disabled'}>Open Flow window</button>
       </div>
-      <p class="flow-note">Images first, then image-to-video. Flow generation uses your own Flow credits. VidMo never stores your Google password, cookies or session tokens. <a href="https://labs.google/fx/tools/flow" target="_blank" rel="noreferrer">Open Flow</a></p>
+      <p class="flow-note">Images first, then image-to-video. Flow uses your own account: images currently cost 0 credits, while video needs Flow credits — an active Google AI Pro/Ultra plan is required for clips. VidMo never stores your Google password, cookies or session tokens. <a href="https://flow.google.com/" target="_blank" rel="noreferrer">Open Flow</a></p>
     </article>`;
 }
 
@@ -1869,16 +1869,16 @@ npm start</div>
                 <h3>Connect your own account</h3>
                 <ol class="flow-steps">
                   <li>VidMo opens a visible Chrome window with a dedicated local profile.</li>
-                  <li>Sign in to Google Flow yourself in that window. VidMo never sees the password.</li>
-                  <li>Return here. VidMo detects sign-in automatically; then generate images first and clips second.</li>
+                  <li>Sign in to Google Flow yourself in that window. Use a personal account with Flow access and a stable connection; VidMo never sees the password.</li>
+                  <li>Return here. VidMo detects sign-in automatically; then generate images first and clips second. Images currently cost 0 credits; video clips need Flow credits from an AI Pro/Ultra plan.</li>
                 </ol>
                 <label class="consent-row">
                   <input type="checkbox" id="flowConsent" ${state.flowConsent ? 'checked' : ''} />
-                  <span>I understand that VidMo will automate clicks in my signed-in Flow session, and that generations spend Flow credits from my own Google account.</span>
+                  <span>I understand that VidMo will automate clicks in my signed-in Flow session, and that paid generations spend Flow credits from my own Google account.</span>
                 </label>
                 <div class="flow-actions">
                   <button class="btn btn-primary" type="button" data-action="connect-flow" ${state.flowConsent ? '' : 'disabled'}>Open Flow in Chrome</button>
-                  <a class="btn btn-ghost" href="https://labs.google/fx/tools/flow" target="_blank" rel="noreferrer">Open Flow in my browser</a>
+                  <a class="btn btn-ghost" href="https://flow.google.com/" target="_blank" rel="noreferrer">Open Flow in my browser</a>
                 </div>
                 <p class="small faint">No iframe, OAuth shortcut or credential storage. Flow has no public API, so this is a real browser session under your control.</p>
               </div>`
@@ -2174,7 +2174,7 @@ async function generateAllImages() {
   await startGeneration('images', {
     stageIds: project.storyboard.stages.map((stage) => stage.id),
     autoApprove: false,
-    confirmation: `Generate ${plural(count, 'stage image')} in Google Flow? This spends Flow credits from your own account and takes a few minutes per image.`,
+    confirmation: `Generate ${plural(count, 'stage image')} in Google Flow? Images currently cost 0 credits and take a few minutes each.`,
   });
 }
 
@@ -2189,7 +2189,7 @@ async function generateAllClips() {
   }
   await startGeneration('clips', {
     stageIds: project.storyboard.stages.map((stage) => stage.id),
-    confirmation: `Generate ${plural(project.storyboard.totalStages, 'video clip')} in Flow? This spends Flow credits and can take several minutes per clip.`,
+    confirmation: `Generate ${plural(project.storyboard.totalStages, 'video clip')} in Flow? Each 8s/720p clip costs 12 Flow credits (prices can change) and takes several minutes.`,
   });
 }
 
@@ -2197,7 +2197,7 @@ async function generateStageImage(index) {
   const stage = state.project.storyboard.stages[index];
   await startGeneration('images', {
     stageIds: [stage.id],
-    confirmation: `Generate a new image for ${stage.id} in Google Flow? This spends one Flow credit.`,
+    confirmation: `Generate a new image take for ${stage.id} in Google Flow? Images currently cost 0 credits.`,
   });
 }
 
