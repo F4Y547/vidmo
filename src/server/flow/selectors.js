@@ -148,13 +148,14 @@ export const BLOCKING_PATTERNS = [
   {
     kind: 'captcha',
     pattern:
-      /verify (?:that )?you(?:'| a)?re human|unusual traffic|complete the captcha|recaptcha|checking your browser/i,
+      /verify (?:that )?you(?:'| a)?re human|unusual traffic|complete the captcha|checking your browser|i(?:'| a)?m not a robot/i,
     message:
       'Google Flow needs a human check. Solve it in the Flow window, then click Resume in VidMo.',
   },
   {
     kind: 'credits',
-    pattern: /not enough credits|insufficient credits|out of credits|buy more credits|credit limit/i,
+    pattern:
+      /not enough credits|(?:don'?t|do not|does not) have enough credits|insufficient credits|out of credits|buy more credits|credit limit/i,
     message:
       'Flow reports that this account has no generation credits. Add credits in Flow, then resume.',
   },
