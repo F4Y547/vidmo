@@ -1804,6 +1804,12 @@ function flowModalHtml() {
   const diagnostics = state.flowDiagnostics;
   const connected = isFlowConnected();
   const mode = flow?.mode === 'stub' ? 'Simulator' : 'Your Google account';
+  const windowLabel =
+    flow?.mode === 'stub'
+      ? 'None — local simulator'
+      : flow?.launchMode === 'attach'
+        ? 'Your Chrome (attached)'
+        : 'VidMo-managed Chrome';
   const status = flow?.status ?? 'disconnected';
 
   return `
@@ -1828,6 +1834,7 @@ function flowModalHtml() {
         <div class="flow-kv-grid">
           <div class="kv"><span>Engine</span><strong>${esc(mode)}</strong></div>
           <div class="kv"><span>Browser</span><strong>${esc(flow?.browser || (flow?.mode === 'stub' ? 'None — local simulator' : 'Chrome / Edge'))}</strong></div>
+          <div class="kv"><span>Window</span><strong>${esc(windowLabel)}</strong></div>
           <div class="kv"><span>Local profile</span><strong class="mono">${esc(flow?.profile || 'data/flow-profile')}</strong></div>
           <div class="kv"><span>Credits</span><strong>Your Flow account</strong></div>
         </div>
@@ -1970,6 +1977,7 @@ function flowSignature(flow = state.flow, diagnostics = state.flowDiagnostics) {
     flow?.paused,
     flow?.screenshotUrl,
     flow?.browser,
+    flow?.launchMode,
     flow?.profile,
     flow?.url,
     flow?.lastError,

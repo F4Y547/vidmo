@@ -89,11 +89,63 @@ function mockFlowHtml(mode) {
 </html>`;
 }
 
-function startMockServer(mode) {
+/**
+ * The October 2026 Flow composer: a ProseMirror prompt, a "Settings trigger"
+ * card with radio options (Image/Video, aspect ratio, output count) and a
+ * "Start generation" submit button.
+ */
+function mockFlowV2Html() {
+  return `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Mock Flow 2026</title></head>
+  <body>
+    <button aria-label="Settings trigger" id="settingsTrigger">🍌 Nano Banana 2.1 x2</button>
+    <div id="settings" hidden>
+      <button role="radio" aria-checked="true" data-group="mode">image Image</button>
+      <button role="radio" aria-checked="false" data-group="mode">videocam Video</button>
+      <button role="radio" aria-checked="true" data-group="aspect">crop_16_9 16:9</button>
+      <button role="radio" aria-checked="false" data-group="aspect">crop_9_16 9:16</button>
+      <button role="radio" aria-checked="false" data-group="count">x1</button>
+      <button role="radio" aria-checked="true" data-group="count">x2</button>
+    </div>
+    <div id="prompt" contenteditable="true" role="textbox" class="ProseMirror"></div>
+    <button type="submit" id="generate">Start generation</button>
+    <div id="results"></div>
+    <script>
+      const IMAGE = ${JSON.stringify(IMAGE_DATA_URL)};
+      const trigger = document.getElementById('settingsTrigger');
+      const settings = document.getElementById('settings');
+      trigger.addEventListener('click', () => { settings.hidden = !settings.hidden; });
+      settings.querySelectorAll('button[role="radio"]').forEach((radio) => {
+        radio.addEventListener('click', () => {
+          settings
+            .querySelectorAll('button[data-group="' + radio.dataset.group + '"]')
+            .forEach((peer) => peer.setAttribute('aria-checked', String(peer === radio)));
+          const aspect = settings.querySelector('button[data-group="aspect"][aria-checked="true"]');
+          const count = settings.querySelector('button[data-group="count"][aria-checked="true"]');
+          trigger.textContent = '🍌 Nano Banana 2.1 ' + (count?.textContent ?? 'x1') + ' ' + (aspect?.textContent ?? '');
+        });
+      });
+      document.getElementById('generate').addEventListener('click', () => {
+        const img = document.createElement('img');
+        img.src = IMAGE;
+        img.width = 360;
+        img.height = 540;
+        img.style.width = '360px';
+        img.style.height = '540px';
+        img.alt = 'mock flow 2026 image';
+        document.getElementById('results').appendChild(img);
+      });
+    </script>
+  </body>
+</html>`;
+}
+
+function startMockServer(mode, html = mockFlowHtml(mode)) {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(mockFlowHtml(mode));
+      res.end(html);
     });
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
@@ -181,6 +233,46 @@ test('mock Flow: generateImage writes the prompt and returns the new image bytes
 
   const promptValue = await page.inputValue('#prompt');
   assert.match(promptValue, /Extreme macro cinematic shot/);
+});
+
+test('mock Flow 2026: image mode selects 9:16, x1, and the Start generation button', async (t) => {
+  const { server, base } = await startMockServer('image', mockFlowV2Html());
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const browser = await launchBrowser(t);
+  if (!browser) {
+    t.skip('Chrome/Edge or playwright-core not available; mock Flow test skipped.');
+    return;
+  }
+
+  const page = await browser.newPage();
+  t.after(() => page.close().catch(() => {}));
+  await page.goto(base, { waitUntil: 'domcontentloaded' });
+
+  const result = await generateImage({
+    session: mockSession(page),
+    prompt: 'Extreme macro shot of a tiny clay pot of biryani on a wooden table, warm window light.',
+    projectId: 'mock-project-2026',
+    projectTitle: 'Mock project',
+    stageLabel: 'S1',
+  });
+
+  assert.equal(result.mimeType, 'image/png');
+  assert.ok(result.buffer.equals(PNG_BYTES), 'image bytes should round-trip unchanged');
+  assert.equal(result.aspectApplied, true);
+
+  const checked = await page.evaluate(() =>
+    [...document.querySelectorAll('button[role="radio"][aria-checked="true"]')].map(
+      (radio) => radio.textContent.trim(),
+    ),
+  );
+  assert.ok(checked.some((label) => /9:16/.test(label)), '9:16 should be selected');
+  assert.ok(checked.some((label) => /x1/.test(label)), 'one output should be selected');
+  assert.ok(checked.some((label) => /Image/.test(label)), 'image mode should stay selected');
+
+  const promptValue = await page.locator('#prompt').innerText();
+  assert.match(promptValue, /Extreme macro shot/);
+  assert.equal(await page.locator('#settings').isHidden(), true, 'settings card should close before generating');
 });
 
 test('mock Flow: generateVideo uploads the approved image and returns the clip bytes', async (t) => {

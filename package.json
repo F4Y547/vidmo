@@ -37,7 +37,8 @@
     "test": "node --test",
     "test:flow": "node --test test/flow.mock.test.js",
     "smoke": "node scripts/smoke.mjs",
-    "flow:discover": "node scripts/flow-discover.mjs"
+    "flow:discover": "node scripts/flow-discover.mjs",
+    "flow:probe": "node scripts/flow-probe.mjs"
   },
   "engines": {
     "node": ">=20.12.0"

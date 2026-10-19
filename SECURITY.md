@@ -24,14 +24,15 @@ VidMo Studio is designed as a **local-first** tool:
   variables and are never written to the data store or returned by the API.
 - Google Flow automation uses the optional `playwright-core` driver to attach
   to a visible Chrome/Edge window with a dedicated local profile
-  (`data/flow-profile`). VidMo never asks for, proxies or stores Google
-  credentials, cookies or session tokens; the sign-in happens directly on
-  Google's page and the session stays in the local browser profile. Flow
-  diagnostics (screenshots, DOM/ARIA snapshots and body-text previews) are
-  written under `data/flow/diagnostics/` on this machine and are not uploaded.
-  Generated media, uploads and assets are stored under `data/media/`; the media
-  endpoint only serves files registered to a project's assets, with Range
-  support.
+  (`data/flow-profile`). VidMo launches a normal browser (no automation flags)
+  with remote debugging on `127.0.0.1:9333` and attaches over CDP. VidMo never
+  asks for, proxies or stores Google credentials, cookies or session tokens;
+  the sign-in happens directly on Google's page and the session stays in the
+  local browser profile. Flow diagnostics (screenshots, DOM/ARIA snapshots and
+  body-text previews) are written under `data/flow/diagnostics/` on this
+  machine and are not uploaded. Generated media, uploads and assets are stored
+  under `data/media/`; the media endpoint only serves files registered to a
+  project's assets, with Range support.
 
 ## Flow-specific notes
 
@@ -41,6 +42,13 @@ VidMo Studio is designed as a **local-first** tool:
   `data/flow/selectors.json`) is user-auditable plain text. VidMo stops and
   waits for you on captchas, credit limits, terms prompts or unexpected UI — it
   does not bypass them.
+- The dedicated Flow profile is started with `--disable-extensions` because
+  Flow rejects pages modified by extensions ("unusual activity"). Set
+  `VIDMO_FLOW_ALLOW_EXTENSIONS=1` only if you accept that Flow may block
+  generation.
+- Chrome's remote-debugging port accepts connections from any local process
+  while the Flow window is open. Keep the port bound to `127.0.0.1`, don't
+  expose it, and disconnect/close the Flow window when you are finished.
 - Treat `data/` as sensitive: it can contain Flow project names, screenshots of
   your signed-in Flow session and generated media. Add it to backups or
   deletion policies accordingly (it is gitignored by default).

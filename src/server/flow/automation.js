@@ -33,13 +33,14 @@ async function diagnostics(session, label) {
   await session.captureDiagnostics().catch(() => {});
 }
 
-async function setPrompt(page, prompt, signal) {
+async function setPrompt(page, prompt, { signal, session } = {}) {
   const selectors = await loadSelectors();
   const field = await findFirst(page, selectors.prompt, { timeout: 15_000 });
   if (!field) {
+    await diagnostics(session, 'prompt-missing');
     throw new FlowAutomationError(
       'The Flow prompt field was not found. Open Flow, capture diagnostics, and check the selector map.',
-      { step: 'prompt' },
+      { step: 'prompt', url: page.url() },
     );
   }
   checkAbort(signal);
@@ -65,9 +66,10 @@ async function setPrompt(page, prompt, signal) {
     .catch(() => '');
   const normalized = String(actual ?? '').trim();
   if (normalized.length < Math.min(40, prompt.length * 0.5)) {
+    await diagnostics(session, 'prompt-rejected');
     throw new FlowAutomationError(
       'The Flow prompt field did not accept the full prompt. This usually means Flow changed its editor. Capture diagnostics and retry.',
-      { step: 'prompt', expected: prompt.length, actual: normalized.length },
+      { step: 'prompt', expected: prompt.length, actual: normalized.length, url: page.url() },
     );
   }
   return normalized.length;
@@ -106,8 +108,112 @@ async function chooseNamedModel(page, name, signal) {
   return false;
 }
 
+/**
+ * The 2026 Flow composer exposes its controls through a "Settings trigger"
+ * button that toggles a card with radio options (Image/Video, aspect ratio,
+ * model family, resolution, duration, output count). These helpers drive that
+ * card and stay inert on Flow builds without it.
+ */
+async function hasNewFlowComposer(page) {
+  const selectors = await loadSelectors();
+  const trigger = (selectors.settingsTrigger ?? []).join(', ');
+  if (!trigger) return false;
+  return page
+    .locator(trigger)
+    .first()
+    .isVisible({ timeout: 500 })
+    .catch(() => false);
+}
+
+async function settingsCardOpen(page) {
+  return page
+    .locator('button[role="radio"]')
+    .first()
+    .isVisible({ timeout: 250 })
+    .catch(() => false);
+}
+
+async function openFlowSettings(page) {
+  if (await settingsCardOpen(page)) return true;
+  const selectors = await loadSelectors();
+  const trigger = await findFirst(page, selectors.settingsTrigger ?? [], { timeout: 1500 });
+  if (!trigger) return false;
+  await trigger.click({ timeout: 5000 }).catch(() => {});
+  const deadline = Date.now() + 2500;
+  while (Date.now() < deadline) {
+    if (await settingsCardOpen(page)) return true;
+    await sleep(120);
+  }
+  return false;
+}
+
+async function closeFlowSettings(page) {
+  if (!(await settingsCardOpen(page))) return;
+  const selectors = await loadSelectors();
+  const trigger = await findFirst(page, selectors.settingsTrigger ?? [], { timeout: 1200 });
+  if (trigger) await trigger.click({ timeout: 5000 }).catch(() => {});
+  await sleep(200);
+}
+
+/**
+ * Click the first visible radio; skip the click when it is already checked so
+ * Flow does not toggle a selection off. Returns true when the option exists.
+ */
+async function setRadio(page, selectorList, { timeout = 1200 } = {}) {
+  for (const selector of selectorList ?? []) {
+    const locator = page.locator(selector).first();
+    if (!(await locator.isVisible({ timeout }).catch(() => false))) continue;
+    const checked = await locator.getAttribute('aria-checked').catch(() => null);
+    if (checked !== 'true') {
+      await locator.click({ timeout: 5000 }).catch(() => {});
+      await sleep(250);
+    }
+    return true;
+  }
+  return false;
+}
+
 async function selectMode(page, mode, { signal, onProgress } = {}) {
   const selectors = await loadSelectors();
+
+  // The 2026 Flow composer keeps Image/Video, aspect, model, resolution and
+  // output count inside a "Settings trigger" panel. Handle it first; the text
+  // and menu selectors below remain as fallbacks for other Flow builds.
+  if (await hasNewFlowComposer(page)) {
+    onProgress?.(mode === 'video' ? 'Switching Flow to video mode…' : 'Switching Flow to image mode…');
+    const opened = await openFlowSettings(page);
+    if (opened) {
+      const modeSelected = await setRadio(
+        page,
+        mode === 'video' ? selectors.videoMode : selectors.imageMode,
+      );
+      if (mode === 'video') {
+        await sleep(500);
+        await setRadio(page, selectors.framesMode, { timeout: 1500 });
+        await setRadio(page, selectors.resolution, { timeout: 1200 });
+        await setRadio(page, selectors.videoDuration, { timeout: 1200 });
+      }
+      await sleep(300);
+      const label = await modelLabel(page);
+      if (!modeSelected) {
+        if (mode === 'video') {
+          throw new FlowAutomationError(
+            'Flow’s new composer did not switch to video mode. Capture diagnostics and check the selector map.',
+            { step: 'video-mode', modelLabel: label },
+          );
+        }
+        return { mode: 'image', label, warning: 'Could not switch Flow back to image mode.' };
+      }
+      return { mode, label, warning: null };
+    }
+    if (mode === 'video') {
+      throw new FlowAutomationError(
+        'Flow’s settings panel did not open, so video mode could not be selected.',
+        { step: 'settings' },
+      );
+    }
+  }
+
   const current = await modelLabel(page);
   const currentLooksVideo = /video|veo|omni|frames/i.test(current);
   const currentLooksImage = /image|nano banana|imagen/i.test(current);
@@ -177,6 +283,24 @@ async function selectMode(page, mode, { signal, onProgress } = {}) {
 async function setAspectRatio(page, { signal } = {}) {
   const selectors = await loadSelectors();
   checkAbort(signal);
+
+  // New Flow composer: pick 9:16 and one output from the settings card.
+  if (await hasNewFlowComposer(page)) {
+    const opened = await openFlowSettings(page);
+    if (opened) {
+      const applied = await setRadio(page, selectors.aspect);
+      await setRadio(page, selectors.outputCount, { timeout: 800 });
+      await closeFlowSettings(page);
+      return applied
+        ? { applied: true, warning: null }
+        : {
+            applied: false,
+            warning:
+              'Flow’s 9:16 aspect control was not found. The prompts still specify vertical 9:16, but check the output ratio.',
+          };
+    }
+  }
+
   const visibleAspect = await findFirst(
     page,
     ['button:has-text("9:16")', '[role="button"]:has-text("9:16")'],
@@ -239,7 +363,30 @@ async function attachStartFrame(page, imagePath, { signal, session } = {}) {
       .waitForEvent('filechooser', { timeout: 6000 })
       .catch(() => null);
     await addStart.click({ timeout: 6000 }).catch(() => {});
-    const chooser = await chooserPromise;
+    let chooser = await chooserPromise;
+    if (!chooser) {
+      // The 2026 "Frames" start tile opens a small menu instead of the file
+      // picker directly. Choose the upload entry, then wait for its chooser.
+      const uploadOption = await findFirst(
+        page,
+        [
+          '[role="menuitem"]:has-text("Upload")',
+          'button:has-text("Upload from computer")',
+          'button:has-text("Upload media")',
+          'button:has-text("Upload")',
+          'text=/Upload from computer/i',
+          'text=/Choose file/i',
+        ],
+        { timeout: 2000 },
+      );
+      if (uploadOption) {
+        const chooserAgain = page
+          .waitForEvent('filechooser', { timeout: 6000 })
+          .catch(() => null);
+        await uploadOption.click({ timeout: 5000 }).catch(() => {});
+        chooser = await chooserAgain;
+      }
+    }
     if (chooser) {
       await chooser.setFiles(imagePath);
     } else if (!fileInput) {
@@ -285,21 +432,23 @@ async function attachStartFrame(page, imagePath, { signal, session } = {}) {
   return path.basename(imagePath);
 }
 
-async function clickGenerate(page, { signal } = {}) {
+async function clickGenerate(page, { signal, session } = {}) {
   const selectors = await loadSelectors();
   checkAbort(signal);
   const button = await findFirst(page, selectors.generate, { timeout: 8000 });
   if (!button) {
+    await diagnostics(session, 'generate-missing');
     throw new FlowAutomationError(
       'Could not find Flow’s Generate button. Capture diagnostics so the selector map can be updated.',
-      { step: 'generate' },
+      { step: 'generate', url: page.url() },
     );
   }
   const disabled = await button.isDisabled().catch(() => false);
   if (disabled) {
+    await diagnostics(session, 'generate-disabled');
     throw new FlowAutomationError(
       'Flow’s Generate button is disabled. Make sure a prompt is present and the account has credits.',
-      { step: 'generate' },
+      { step: 'generate', url: page.url() },
     );
   }
   await button.click({ timeout: 10_000 });
@@ -538,15 +687,15 @@ export async function generateImage({
   await session.ensureReady({ signal, onWait: onProgress });
   return session.runExclusive(async () => {
     const page = session.page;
-    await session.startProject(projectId, projectTitle);
+    await session.startProject(projectId, projectTitle, onProgress);
     const mode = await selectMode(page, 'image', { signal, onProgress });
     const aspect = await setAspectRatio(page, { signal });
     if (aspect.warning) onProgress?.(aspect.warning);
     onProgress?.(`Writing the image prompt for ${stageLabel || 'this stage'}…`);
-    const length = await setPrompt(page, prompt, signal);
+    const length = await setPrompt(page, prompt, { signal, session });
     const before = await mediaSignature(page, 'image');
     onProgress?.('Sending the image to Google Flow…');
-    await clickGenerate(page, { signal });
+    await clickGenerate(page, { signal, session });
     const candidate = await waitForResult(page, 'image', before, { signal, session, onProgress });
     const media = await captureCandidate(page, candidate, 'image', { session });
     return {
@@ -577,17 +726,17 @@ export async function generateVideo({
   await session.ensureReady({ signal, onWait: onProgress });
   return session.runExclusive(async () => {
     const page = session.page;
-    await session.startProject(projectId, projectTitle);
+    await session.startProject(projectId, projectTitle, onProgress);
     const mode = await selectMode(page, 'video', { signal, onProgress });
     const aspect = await setAspectRatio(page, { signal });
     if (aspect.warning) onProgress?.(aspect.warning);
     onProgress?.(`Uploading the approved stage image for ${stageLabel || 'this stage'}…`);
     await attachStartFrame(page, startImagePath, { signal, session });
     onProgress?.('Writing the motion prompt…');
-    const length = await setPrompt(page, prompt, signal);
+    const length = await setPrompt(page, prompt, { signal, session });
     const before = await mediaSignature(page, 'clip');
     onProgress?.('Sending the shot to Flow video generation…');
-    await clickGenerate(page, { signal });
+    await clickGenerate(page, { signal, session });
     const candidate = await waitForResult(page, 'clip', before, { signal, session, onProgress });
     const media = await captureCandidate(page, candidate, 'clip', { session });
     return {

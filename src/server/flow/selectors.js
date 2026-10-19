@@ -25,11 +25,46 @@ export const DEFAULT_SELECTORS = {
     'button[aria-label*="new project" i]',
   ],
   generate: [
+    'button:has-text("Start generation")',
+    'button[aria-label*="Start generation" i]',
     'button:has-text("Generate")',
     'button[aria-label*="Generate" i]',
     '[role="button"]:has-text("Generate")',
     'button:has-text("Create")',
     'button[type="submit"]:has-text("Generate")',
+    'button[type="submit"]',
+  ],
+  settingsTrigger: [
+    'button[aria-label="Settings trigger"]',
+    'button[aria-label*="Settings trigger" i]',
+  ],
+  imageMode: [
+    'button[role="radio"]:has-text("Image")',
+    '[role="radio"]:has-text("Image")',
+  ],
+  videoMode: [
+    'button[role="radio"]:has-text("Video")',
+    '[role="radio"]:has-text("Video")',
+  ],
+  framesMode: [
+    'button[role="radio"]:has-text("Frames")',
+    '[role="radio"]:has-text("Frames")',
+  ],
+  modelFamily: [
+    'button[aria-label="Select model family"]',
+    'button[aria-label*="model family" i]',
+  ],
+  outputCount: [
+    'button[role="radio"]:has-text("x1")',
+    '[role="radio"]:has-text("x1")',
+  ],
+  resolution: [
+    'button[role="radio"]:has-text("720p")',
+    '[role="radio"]:has-text("720p")',
+  ],
+  videoDuration: [
+    'button[role="radio"]:has-text("8s")',
+    '[role="radio"]:has-text("8s")',
   ],
   model: [
     'button:has-text("Nano Banana")',
@@ -61,6 +96,9 @@ export const DEFAULT_SELECTORS = {
     'text=/^Frames$/i',
   ],
   addStartFrame: [
+    'button[aria-label="Start"]',
+    'text=/^Start$/',
+    'text=/^Start frame$/i',
     'text=/Add start frame/i',
     'button:has-text("start frame")',
     '[role="button"]:has-text("start frame")',
@@ -74,6 +112,7 @@ export const DEFAULT_SELECTORS = {
     '[aria-label*="reference" i]',
   ],
   aspect: [
+    'button[role="radio"]:has-text("9:16")',
     'button:has-text("9:16")',
     '[role="menuitem"]:has-text("9:16")',
     '[role="option"]:has-text("9:16")',
@@ -96,6 +135,12 @@ export const DEFAULT_SELECTORS = {
     '[role="button"]:has-text("Download")',
   ],
   busy: ['[aria-busy="true"]', 'text=/Generating|Creating|Rendering/i'],
+  signIn: [
+    'a:has-text("Sign in")',
+    'button:has-text("Sign in")',
+    '[role="button"]:has-text("Sign in")',
+    'a[href*="accounts.google.com"]',
+  ],
   errorDialog: ['[role="dialog"]', '[role="alert"]'],
 };
 
@@ -122,6 +167,13 @@ export const BLOCKING_PATTERNS = [
     kind: 'terms',
     pattern: /accept the terms|agree to the terms|review and accept/i,
     message: 'Flow is asking you to accept new terms. Accept them in the Flow window, then resume.',
+  },
+  {
+    kind: 'failure',
+    pattern:
+      /unusual activity|automated queries|browser extensions that modify the page/i,
+    message:
+      'Flow blocked this generation as unusual activity (its page mentions extensions or automation). Close browser extensions in the Flow window, then retry.',
   },
   {
     kind: 'failure',
@@ -171,20 +223,29 @@ export function detectBlockingText(text) {
 }
 
 export async function findFirst(page, selectors, { timeout = 1200, visible = true } = {}) {
-  for (const selector of selectors ?? []) {
-    const locator = page.locator(selector).first();
-    try {
-      if (visible) {
-        if (await locator.isVisible({ timeout })) return locator;
-      } else {
-        await locator.waitFor({ state: 'attached', timeout });
-        return locator;
+  const list = selectors ?? [];
+  if (!list.length) return null;
+  const deadline = Date.now() + timeout;
+  // Check every selector in short rounds so a missing first selector does not
+  // eat the whole budget and hide a later, visible match.
+  const perTry = Math.max(120, Math.min(400, Math.round(timeout / Math.max(2, list.length)) || 200));
+  while (true) {
+    for (const selector of list) {
+      const locator = page.locator(selector).first();
+      try {
+        if (visible) {
+          if (await locator.isVisible({ timeout: perTry })) return locator;
+        } else {
+          await locator.waitFor({ state: 'attached', timeout: perTry });
+          return locator;
+        }
+      } catch {
+        /* try the next selector */
       }
-    } catch {
-      /* try the next selector */
+      if (Date.now() >= deadline) return null;
     }
+    if (Date.now() >= deadline) return null;
   }
-  return null;
 }
 
 export async function clickFirst(page, selectors, label, options = {}) {
@@ -215,16 +276,21 @@ export async function inspectFlowPage(page) {
   const selectors = await loadSelectors();
   const prompt = await findFirst(page, selectors.prompt, { timeout: 500 });
   const newProject = await findFirst(page, selectors.newProject, { timeout: 400 });
+  const signInControl = await findFirst(page, selectors.signIn ?? [], { timeout: 300 });
   const signInVisible =
+    Boolean(signInControl) ||
     /accounts\.google\.com/i.test(url) ||
     /sign in|use your google account|choose an account/i.test(text);
   const blocked = detectBlockingText(text);
-  const onFlow = /labs\.google\/fx\/tools\/flow/i.test(url);
+  // flow.google.com also serves public marketing pages (/about, /pricing); only
+  // the app itself counts as "on Flow".
+  const isMarketing = /flow\.google\.com\/(about|pricing|faq)/i.test(url);
+  const onFlow = !isMarketing && /flow\.google\.com|labs\.google\/fx\/tools\/flow/i.test(url);
   const title = await page.title().catch(() => '');
 
   let state = 'unknown';
   if (prompt || newProject) state = 'ready';
-  else if (signInVisible || /accounts\.google\.com/i.test(url)) state = 'awaiting_login';
+  else if (signInVisible || isMarketing) state = 'awaiting_login';
   else if (onFlow) state = 'ready';
 
   return {
@@ -233,6 +299,7 @@ export async function inspectFlowPage(page) {
     title,
     text,
     onFlow,
+    isMarketing,
     signInVisible,
     hasPrompt: Boolean(prompt),
     hasNewProject: Boolean(newProject),

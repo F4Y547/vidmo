@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Support for the October 2026 Flow composer** (agent-style workspace):
+  ProseMirror prompt, “Start generation”, and the Settings card with
+  Image/Video mode, Frames/Ingredients, aspect ratio, model family, output
+  count, video resolution and duration. VidMo selects Image → 9:16 → x1 for
+  stage images and Video → Frames → 9:16 → 720p → 8s → x1 for clips.
+- Chrome attach mode: VidMo now starts a normal visible Chrome (no automation
+  flags) with remote debugging bound to `127.0.0.1:9333` and attaches over CDP,
+  so Google accepts the interactive sign-in. A Flow window already listening on
+  that port is reused. Configurable with `VIDMO_FLOW_CDP` and
+  `VIDMO_FLOW_CDP_PORT`.
+- `VIDMO_FLOW_SIGNIN_URL` and a deterministic sign-in button that opens
+  Google's real account page with `continue=https://flow.google.com/`.
+- `VIDMO_FLOW_ALLOW_EXTENSIONS`: the dedicated Flow profile now launches with
+  `--disable-extensions` by default because Flow rejects pages modified by
+  extensions ("unusual activity").
+- `npm run flow:probe`: attach to the open Flow window and print its URL, tabs,
+  visible interactive elements and optional screenshot/ARIA snapshot for
+  selector maintenance.
+- Deterministic detection of Flow's "We noticed some unusual activity" block,
+  with a clear failure message instead of waiting for the image timeout.
+- Diagnostics capture (screenshot + DOM/ARIA) when the prompt field is missing
+  or rejected, the Generate button is missing/disabled, or the Flow composer
+  fails to open after creating a project.
+- Mock-Flow coverage for the 2026 composer (mode/aspect/count selection,
+  "Start generation", settings card close) in `npm run test:flow`.
+
+### Changed
+
+- Flow project creation now waits for either the composer or the New project
+  button, uses visible-first selector matching, and reports progress while
+  opening/creating the Flow project.
+- `findFirst` checks all selectors in short rounds within one deadline, so a
+  hidden legacy selector can no longer consume the whole timeout and hide a
+  visible modern match.
+- Sign-in readiness ignores Flow's marketing pages and nudges signed-in users
+  back to the app; the Flow panel/modal only re-renders when its signature
+  changes, preventing animation restarts during polling.
+
+### Fixed
+
+- Flow's 9:16 radio is now verified via `aria-checked` and clicked when needed
+  (the old code assumed any visible "9:16" label meant the ratio was applied).
+- Video mode selects the Frames composer explicitly and falls back through an
+  upload menu when the start-frame tile does not open a file chooser directly.
+- The Flow panel no longer crashes on a missing stage generation record (TDZ
+  shadowing) and no longer loses the selected tab during status polling.
+
+## [1.1.0] — 2026-10-19
+
+### Added
+
 - **Google Flow generation** (opt-in): connect your own signed-in Flow session
   in a visible Chrome/Edge window (optional `playwright-core` driver), generate
   all stage images from the locked image prompts, approve one take per stage,
@@ -33,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Store format v2; existing v1 data remains readable.
-- ZIP/ZIP exports now include generated images and clips when present.
+- ZIP exports now include generated images and clips when present.
 - Store writes retry transient Windows rename locks instead of failing jobs.
 - Expected 4xx API errors no longer spam the server console.
 
@@ -72,4 +123,5 @@ Initial release.
 - GitHub Actions CI running tests on Node 20, 22 and 24 with a live smoke
   run on every push and pull request.
 
+[1.1.0]: https://github.com/F4Y547/vidmo/releases/tag/v1.1.0
 [1.0.0]: https://github.com/F4Y547/vidmo/releases/tag/v1.0.0

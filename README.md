@@ -69,11 +69,11 @@ These are enforced in the prompt engine and asserted by the test suite — they 
 
 The storyboard step can drive image and image-to-video generation inside **your own** Google Flow session, so the whole film comes out of one pipeline:
 
-1. In the Flow panel, click **Connect Google Flow**. VidMo opens a visible Chrome window with its own local profile (`data/flow-profile`).
-2. **You sign in to Google yourself** in that window. VidMo never asks for, proxies or stores your password, cookies or tokens — it attaches to a normal signed-in browser session you control.
-3. **Generate all images** (or per-stage). Prompts are written from the locked storyboard: 9:16, image model, one job at a time, with credit warnings before every batch.
+1. In the Flow panel, click **Connect Google Flow**. VidMo opens (or reuses) a normal Chrome window with its own local profile (`data/flow-profile`), started without automation flags and with remote debugging on `127.0.0.1:9333`; VidMo attaches over CDP.
+2. **You sign in to Google yourself** in that window. The button opens Google's real account page (`accounts.google.com`), then returns to Flow. VidMo never asks for, proxies or stores your password, cookies or tokens — it attaches to a normal signed-in browser session you control.
+3. **Generate all images** (or per-stage). Prompts are written from the locked storyboard: Image mode, 9:16, one output, one job at a time, with credit warnings before every batch.
 4. **Review and approve one image take per stage.** The clip buttons stay locked until a stage image is approved — approved images become the image-to-video start frames.
-5. **Generate all clips.** Flow animates each approved image with the locked motion prompt.
+5. **Generate all clips.** Flow switches to Video → Frames, uploads the approved image as the start frame, applies the locked motion prompt, 9:16 / 720p / 8s, and animates it.
 6. Download, reroll, upload your own takes, or remove assets per stage. Everything is stored locally under `data/media/` and is included in the ZIP and Flow pack exports.
 
 Design constraints:
@@ -81,8 +81,11 @@ Design constraints:
 - **Google Flow has no public generation API.** VidMo automates the real signed-in web app in a visible browser window — no iframe embedding, no OAuth shortcuts, no private endpoints.
 - **Your credits, your account.** Flow generations consume Flow credits from your own Google account; VidMo does not include, resell or proxy credits.
 - **Nothing is bypassed.** If Flow shows a captcha, a credit warning, new terms or an unexpected UI, VidMo pauses generation, saves a screenshot and waits for you to resolve it in the Flow window, then Resume.
+- **Current Flow UI (October 2026) is supported.** VidMo drives the agent-style composer: ProseMirror prompt, “Start generation”, and the Settings card (Image/Video, Frames, aspect ratio, model family, resolution, duration, output count). Older layouts remain as selector fallbacks.
+- **Extensions are disabled in the Flow window.** Flow blocks generations with “We noticed some unusual activity” when extensions inject scripts into its page, so the dedicated profile starts with `--disable-extensions`. Set `VIDMO_FLOW_ALLOW_EXTENSIONS=1` to opt out.
+- **If Flow still reports “unusual activity”** it is a Google anti-abuse/rate-limit decision, not a VidMo error. Close other apps using the account, wait a few minutes, avoid VPNs/proxies, and use a personal Google account that has Flow access; shared or region-hopping accounts are frequently flagged. VidMo stops the batch and records the message instead of retrying blindly.
 - **Fail-safe fallback.** Every project always exports a **Flow pack** (openable board, per-stage image/video prompts, manifest, shot list and import-back instructions) so manual Flow work or any other model works with zero automation.
-- **Selectors are transparent and editable.** Flow's DOM is not a public API; the selector map lives in `src/server/flow/selectors.js` and can be overridden per machine with `data/flow/selectors.json`. `npm run flow:discover` captures the live DOM, a screenshot and a `selectors.suggested.json` while you are signed in.
+- **Selectors are transparent and editable.** Flow's DOM is not a public API; the selector map lives in `src/server/flow/selectors.js` and can be overridden per machine with `data/flow/selectors.json`. `npm run flow:discover` captures the live DOM, a screenshot and a `selectors.suggested.json` while you are signed in; `npm run flow:probe` attaches to the open Flow window for quick DOM checks.
 
 The Flow driver is the only optional dependency: `npm install playwright-core`. Without it, the core studio, all prompts and all exports still work — Connect simply reports the missing driver.
 
@@ -126,6 +129,9 @@ Everything is optional — see [`.env.example`](.env.example) for the full list.
 | `VIDMO_FLOW_MODE` | `browser` (default) or `stub` simulator |
 | `VIDMO_FLOW_BROWSER` | Explicit Chrome/Edge executable path |
 | `VIDMO_FLOW_HEADLESS` | `1` to hide the Flow window (sign-in still needs a visible run once) |
+| `VIDMO_FLOW_CDP`, `VIDMO_FLOW_CDP_PORT` | Attach to a normal visible Chrome over CDP (on by default, port `9333`) |
+| `VIDMO_FLOW_SIGNIN_URL` | Google sign-in page opened by Connect (must be a real `accounts.google.com` URL) |
+| `VIDMO_FLOW_ALLOW_EXTENSIONS` | `1` keeps extensions in the Flow profile; Flow may then block generation |
 | `VIDMO_FLOW_PROFILE_DIR`, `VIDMO_FLOW_DIR` | Local Flow profile and diagnostics location |
 | `VIDMO_FLOW_IMAGE_MODEL`, `VIDMO_FLOW_VIDEO_MODEL` | Preferred Flow models when the picker is available |
 | `VIDMO_FLOW_IMAGE_TIMEOUT_MS`, `VIDMO_FLOW_VIDEO_TIMEOUT_MS` | Generation timeouts (images ~8 min, clips ~25 min by default) |

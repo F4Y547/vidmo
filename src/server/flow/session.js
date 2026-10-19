@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { FLOW_DIR, FLOW_PROFILE_DIR, relativeDataPath } from '../paths.js';
 import {
   FlowAutomationError,
@@ -7,12 +8,25 @@ import {
   FlowError,
   flowUnavailable,
 } from './errors.js';
-import { inspectFlowPage, loadSelectors, visibleText } from './selectors.js';
+import { findFirst, inspectFlowPage, loadSelectors, visibleText } from './selectors.js';
 
 const FLOW_URL = process.env.VIDMO_FLOW_URL || 'https://labs.google/fx/tools/flow';
 const LOGIN_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_LOGIN_TIMEOUT_MS || 10 * 60 * 1000);
 const ATTENTION_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_ATTENTION_TIMEOUT_MS || 30 * 60 * 1000);
 const DIAGNOSTICS_DIR = path.join(FLOW_DIR, 'diagnostics');
+
+/**
+ * Google rejects sign-in in a browser that advertises automation, so VidMo
+ * launches Chrome the way a person would (no automation flags) and attaches to
+ * it over the DevTools protocol. The sign-in then happens in a genuine Google
+ * browser session that VidMo never sees the credentials for. Set
+ * VIDMO_FLOW_CDP=0 to force the Playwright-managed window instead.
+ */
+const CDP_ATTACH_ENABLED = process.env.VIDMO_FLOW_CDP !== '0';
+const CDP_PORT = Number(process.env.VIDMO_FLOW_CDP_PORT || 9333);
+const SIGN_IN_URL =
+  process.env.VIDMO_FLOW_SIGNIN_URL ||
+  'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fflow.google.com%2F';
 
 let playwrightModule = null;
 let playwrightError = null;
@@ -85,6 +99,24 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Close a Chrome we launched ourselves, including its child processes. The
+ * browser was started detached so it survives the VidMo server, which means we
+ * have to terminate the whole tree by hand.
+ */
+function closeSpawnedBrowser(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    } else {
+      process.kill(-pid, 'SIGTERM');
+    }
+  } catch {
+    /* the window was already closed */
+  }
+}
+
 function abortError() {
   const error = new Error('Generation cancelled');
   error.code = 'generation_cancelled';
@@ -104,6 +136,9 @@ class FlowSession {
     this.lastError = null;
     this.context = null;
     this.page = null;
+    this.browser = null;
+    this.spawnedPid = null;
+    this.launchMode = 'playwright';
     this.browserLabel = null;
     this.monitor = null;
     this.monitoring = false;
@@ -115,6 +150,7 @@ class FlowSession {
     this.lastInspection = null;
     this.latestScreenshot = null;
     this.connectPromise = null;
+    this.lastHomeNudgeAt = 0;
   }
 
   get isStub() {
@@ -151,6 +187,7 @@ class FlowSession {
       installNote,
       headless: this.headless,
       browser: this.browserLabel,
+      launchMode: this.launchMode,
       flowUrl: FLOW_URL,
       profile: relativeDataPath(FLOW_PROFILE_DIR),
       connected: Boolean(this.context),
@@ -162,6 +199,15 @@ class FlowSession {
       screenshotUrl,
       loginTimeoutMs: LOGIN_TIMEOUT_MS,
       url: this.page && !this.page.isClosed() ? this.page.url() : null,
+      tabs: this.context
+        ? this.context.pages().map((candidate) => {
+            try {
+              return candidate.url();
+            } catch {
+              return '(closed)';
+            }
+          })
+        : [],
     };
   }
 
@@ -205,6 +251,20 @@ class FlowSession {
     await fs.mkdir(DIAGNOSTICS_DIR, { recursive: true });
 
     const browser = await installedBrowser();
+
+    // Preferred path: a real, non-automated Chrome that Google will accept for
+    // sign-in. The Playwright-managed window below stays as a fallback for
+    // environments where a local DevTools port is not available.
+    if (CDP_ATTACH_ENABLED && !this.headless && browser?.executablePath) {
+      try {
+        return await this.attachToVisibleChrome({ chromium, browser });
+      } catch (error) {
+        this.lastError = error?.message || String(error);
+        closeSpawnedBrowser(this.spawnedPid);
+        this.spawnedPid = null;
+      }
+    }
+
     const baseOptions = {
       headless: this.headless,
       viewport: null,
@@ -283,6 +343,141 @@ class FlowSession {
     return this.describe();
   }
 
+  /**
+   * Launch Chrome the way a person would and attach to it over the DevTools
+   * protocol. Without the automation flag Google accepts the sign-in, and the
+   * session stays a normal browser profile that the user controls.
+   */
+  async attachToVisibleChrome({ chromium, browser }) {
+    const endpoint = `http://127.0.0.1:${CDP_PORT}`;
+    // A previous Flow window may still be open (for example after a server
+    // restart). Reuse it rather than spawning a second browser on the profile.
+    let existing = null;
+    try {
+      const response = await fetch(`${endpoint}/json/version`);
+      if (response.ok) {
+        const version = await response.json();
+        if (/chrome|edg/i.test(version?.Browser ?? '')) existing = version;
+      }
+    } catch {
+      /* no browser on the debugging port yet */
+    }
+
+    if (!existing) {
+      // Flow refuses to generate ("unusual activity") when extensions inject
+      // scripts into its page, so the dedicated Flow profile starts without
+      // extensions unless the user explicitly wants them.
+      const extensionArgs =
+        process.env.VIDMO_FLOW_ALLOW_EXTENSIONS === '1' ? [] : ['--disable-extensions'];
+      const child = spawn(
+        browser.executablePath,
+        [
+          `--remote-debugging-port=${CDP_PORT}`,
+          `--user-data-dir=${FLOW_PROFILE_DIR}`,
+          ...extensionArgs,
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--start-maximized',
+          FLOW_URL,
+        ],
+        { detached: true, stdio: 'ignore' },
+      );
+      child.unref();
+      this.spawnedPid = child.pid ?? null;
+
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline && !existing) {
+        try {
+          const response = await fetch(`${endpoint}/json/version`);
+          if (response.ok) existing = await response.json();
+        } catch {
+          /* the DevTools endpoint is not up yet */
+        }
+        if (!existing && child.exitCode !== null) {
+          throw new FlowError(
+            'flow_cdp_unavailable',
+            'The Chrome window closed before its debugging endpoint came up.',
+            { statusCode: 502 },
+          );
+        }
+        if (!existing) await sleep(400);
+      }
+    }
+    if (!existing) {
+      throw new FlowError(
+        'flow_cdp_unavailable',
+        'The Chrome window did not expose its local debugging endpoint.',
+        { statusCode: 502 },
+      );
+    }
+
+    const connection = await chromium.connectOverCDP(endpoint, { timeout: 20_000 });
+    this.browser = connection;
+    this.launchMode = 'attach';
+    this.browserLabel = browser.label;
+    this.context = connection.contexts()[0] ?? (await connection.newContext());
+    connection.on('disconnected', () => {
+      if (!this.browser) return;
+      this.browser = null;
+      this.context = null;
+      this.page = null;
+      this.spawnedPid = null;
+      this.stopMonitor();
+      this.setStatus('disconnected', 'The Flow browser window was closed.');
+    });
+
+    const pages = this.context.pages();
+    this.page =
+      pages.find((candidate) => /flow\.google\.com|labs\.google|accounts\.google/i.test(candidate.url())) ??
+      pages[0] ??
+      (await this.context.newPage());
+    this.connectedAt = new Date().toISOString();
+    this.activeProjectKey = null;
+    this.setStatus('awaiting_login', 'Sign in to Google Flow in the Chrome window, then return here.');
+
+    try {
+      await this.page.goto(FLOW_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch (error) {
+      this.lastError = error.message;
+      this.setStatus(
+        'attention',
+        `Flow did not load cleanly (${error.message}). Check the browser window, then click Resume.`,
+      );
+      await this.screenshot({ label: 'load-failure' });
+    }
+
+    const inspection = await inspectFlowPage(this.page).catch(() => null);
+    this.lastInspection = inspection;
+    if (inspection?.state === 'ready' && inspection.onFlow) {
+      this.setStatus('ready', 'Google Flow is signed in and ready.');
+    } else {
+      await this.gotoSignIn().catch(() => {});
+      this.setStatus(
+        'awaiting_login',
+        'Sign in to your Google account in the Flow window. VidMo never sees or stores the password.',
+      );
+    }
+    this.startMonitor();
+    return this.describe();
+  }
+
+  /**
+   * Walk the attached window to Google's own sign-in entry. This is the same
+   * page Flow's "Sign in" control leads to; the user types the password there
+   * and VidMo only navigates — it never reads the credentials.
+   */
+  async gotoSignIn() {
+    if (!this.page || this.page.isClosed()) return false;
+    if (/accounts\.google\.com/i.test(this.page.url())) return true;
+    try {
+      await this.page.goto(SIGN_IN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch (error) {
+      this.lastError = error?.message ?? String(error);
+      return false;
+    }
+    return true;
+  }
+
   startMonitor() {
     if (this.monitor) return;
     this.monitor = setInterval(() => {
@@ -319,6 +514,18 @@ class FlowSession {
       if (inspection.state === 'ready') {
         this.setStatus('ready', 'Google Flow is signed in and ready.');
       } else if (inspection.state === 'awaiting_login') {
+        // A signed-in user can still land on Flow's public marketing page; walk
+        // them back into the app without interrupting a Google sign-in page.
+        if (
+          inspection.isMarketing &&
+          !inspection.signInVisible &&
+          Date.now() - this.lastHomeNudgeAt > 30_000
+        ) {
+          this.lastHomeNudgeAt = Date.now();
+          await this.page
+            .goto(FLOW_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+            .catch(() => {});
+        }
         this.setStatus(
           'awaiting_login',
           'Waiting for Google sign-in. Complete it in the visible Flow window; VidMo will detect it automatically.',
@@ -382,40 +589,44 @@ class FlowSession {
     }
   }
 
-  async startProject(projectId, title = '') {
+  async startProject(projectId, title = '', onProgress) {
     if (this.mode === 'stub') return;
     if (!this.page || this.page.isClosed()) {
       throw new FlowError('flow_not_connected', 'Open Google Flow first.', { statusCode: 409 });
     }
     if (this.activeProjectKey === projectId) {
       const selectors = await loadSelectors();
-      const prompt = await this.page.locator(selectors.prompt.join(', ')).first().isVisible().catch(() => false);
+      const prompt = await findFirst(this.page, selectors.prompt, { timeout: 500 });
       if (prompt) return;
     }
 
+    onProgress?.('Opening Google Flow…');
     await this.page.goto(FLOW_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     const selectors = await loadSelectors();
-    const prompt = await this.page
-      .locator(selectors.prompt.join(', '))
-      .first()
-      .isVisible()
-      .catch(() => false);
+    // Wait until either the composer or the "New project" button is on screen.
+    await findFirst(
+      this.page,
+      [...selectors.prompt, ...selectors.newProject],
+      { timeout: 10_000 },
+    );
+    let prompt = await findFirst(this.page, selectors.prompt, { timeout: 800 });
 
     if (!prompt) {
-      const newProject = await this.page
-        .locator(selectors.newProject.join(', '))
-        .first()
-        .isVisible()
-        .catch(() => false);
+      onProgress?.('Creating a Flow project for this film…');
+      const newProject = await findFirst(this.page, selectors.newProject, { timeout: 3000 });
       if (newProject) {
-        await this.page.locator(selectors.newProject.join(', ')).first().click({ timeout: 8000 });
+        await newProject.click({ timeout: 8000 }).catch(() => {});
+        prompt = await findFirst(this.page, selectors.prompt, { timeout: 20_000 });
       }
     }
-    await this.page
-      .locator(selectors.prompt.join(', '))
-      .first()
-      .waitFor({ state: 'visible', timeout: 20_000 })
-      .catch(() => {});
+    if (!prompt) {
+      await this.captureDiagnostics().catch(() => {});
+      throw new FlowError(
+        'flow_project_open_failed',
+        'Flow’s composer did not appear, so the generation was stopped. Capture diagnostics from the Flow panel and try again.',
+        { statusCode: 502 },
+      );
+    }
     this.activeProjectKey = projectId;
     this.setStatus('busy', `Flow project ready${title ? ` for ${title}` : ''}.`);
   }
@@ -591,15 +802,29 @@ class FlowSession {
 
   async disconnect({ clearProfile = false } = {}) {
     this.stopMonitor();
+    const browser = this.browser;
     const context = this.context;
+    const spawnedPid = this.spawnedPid;
+    this.browser = null;
     this.context = null;
     this.page = null;
+    this.spawnedPid = null;
     this.activeProjectKey = null;
     this.connectedAt = null;
     this.attentionReason = null;
     this.pausedManually = false;
-    if (context) {
+    this.launchMode = 'playwright';
+    if (browser) {
+      // Attached over CDP: closing the connection may leave the window open, so
+      // the spawned browser is terminated explicitly before the profile is
+      // reused or cleared.
+      await browser.close().catch(() => {});
+    } else if (context) {
       await context.close().catch(() => {});
+    }
+    if (spawnedPid) {
+      closeSpawnedBrowser(spawnedPid);
+      await sleep(400);
     }
     this.setStatus('disconnected', 'Google Flow is not connected.');
     if (clearProfile) {
