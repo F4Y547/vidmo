@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest an idea or improvement for VidMo Studio
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow gap or pain point, not just the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should the studio do differently? Mockups and examples welcome.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Prompt engine / production rules
+        - Dish or audience content
+        - Studio UI
+        - Exports / render bridge
+        - API / automation
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      description: This project intentionally stays zero-dependency, local-first, and rule-locked.
+      options:
+        - label: I understand this feature must not add runtime dependencies or a build step.
+          required: true
+        - label: I understand the production rules (ASMR-only audio, macro, scale, continuity) must not be weakened.
+          required: true

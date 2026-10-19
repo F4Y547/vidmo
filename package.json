@@ -3,7 +3,31 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "VidMo Studio — an end-to-end miniature cooking video production and prompt automation system.",
+  "description": "Zero-dependency miniature cooking film studio: turns an audience + dish choice into a locked storyboard of extreme-macro image prompts, motion prompts, ASMR-only audio and render-ready exports.",
+  "license": "MIT",
+  "author": "Faysal Matheen <faysalmatheen@gmail.com> (https://github.com/F4Y547)",
+  "homepage": "https://github.com/F4Y547/vidmo#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/F4Y547/vidmo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/F4Y547/vidmo/issues"
+  },
+  "keywords": [
+    "miniature-cooking",
+    "tiny-food",
+    "video-generation",
+    "prompt-engineering",
+    "asmr",
+    "shorts",
+    "reels",
+    "veo",
+    "kling",
+    "runway",
+    "sora",
+    "food-photography"
+  ],
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
@@ -11,6 +35,6 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12.0"
   }
 }
