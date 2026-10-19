@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="VidMo Studio turns one dish idea into a complete miniature cooking video production package: stage plan, macro image prompts, motion prompts and locked ASMR audio direction."
+    />
+    <meta name="theme-color" content="#0b0a09" />
+    <title>VidMo Studio — Miniature Cooking Film Automation</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop" aria-hidden="true">
+      <span class="backdrop-glow backdrop-glow-a"></span>
+      <span class="backdrop-glow backdrop-glow-b"></span>
+      <span class="grain"></span>
+    </div>
+
+    <div class="app">
+      <aside class="sidebar" id="sidebar" aria-label="Studio navigation">
+        <div class="brand">
+          <span class="brand-mark" id="brandMark"></span>
+          <span class="brand-text"><strong>VidMo</strong><small>Miniature Film Studio</small></span>
+        </div>
+
+        <button class="btn btn-primary btn-block" data-action="new-film" type="button">
+          <span aria-hidden="true">＋</span> New film
+        </button>
+
+        <nav class="steps" id="stepNav" aria-label="Production steps"></nav>
+
+        <section class="library" aria-label="Film library">
+          <div class="library-head">
+            <span>Film library</span>
+            <span class="library-count" id="libraryCount">0</span>
+          </div>
+          <div class="library-list" id="libraryList">
+            <p class="library-empty">No films yet. Start with an audience.</p>
+          </div>
+        </section>
+
+        <footer class="sidebar-foot">
+          <button class="status-chip" id="aiChip" data-action="open-settings" type="button">
+            <span class="status-dot"></span><span class="status-label">AI: local engine</span>
+          </button>
+          <button class="status-chip" id="renderChip" data-action="open-settings" type="button">
+            <span class="status-dot"></span><span class="status-label">Render: export mode</span>
+          </button>
+        </footer>
+      </aside>
+
+      <div class="sidebar-scrim" id="sidebarScrim" data-action="toggle-sidebar" aria-hidden="true"></div>
+
+      <main class="main">
+        <header class="topbar">
+          <button class="icon-btn menu-btn" data-action="toggle-sidebar" type="button" aria-label="Toggle navigation">
+            <span aria-hidden="true">☰</span>
+          </button>
+          <div class="crumbs" id="crumbs"></div>
+          <div class="topbar-actions" id="topbarActions"></div>
+        </header>
+        <div class="view" id="view" tabindex="-1"></div>
+      </main>
+    </div>
+
+    <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+    <div class="modal-root" id="modalRoot" hidden></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

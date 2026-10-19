@@ -1,0 +1,16 @@
+{
+  "name": "vidmo-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VidMo Studio — an end-to-end miniature cooking video production and prompt automation system.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
