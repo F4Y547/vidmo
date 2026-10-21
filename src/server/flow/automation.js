@@ -4,6 +4,8 @@ import { FlowAutomationError, FlowError } from './errors.js';
 import {
   clickFirst,
   detectBlockingText,
+  diffFailureCounts,
+  failureMarkerCounts,
   findFirst,
   loadSelectors,
   modelLabel,
@@ -12,9 +14,28 @@ import {
 
 const IMAGE_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_IMAGE_TIMEOUT_MS || 8 * 60 * 1000);
 const VIDEO_TIMEOUT_MS = Number(process.env.VIDMO_FLOW_VIDEO_TIMEOUT_MS || 25 * 60 * 1000);
+const POLL_MS = Math.max(50, Number(process.env.VIDMO_FLOW_POLL_MS) || 2500);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * A small human cadence between UI actions. Flow's anti-abuse check is less
+ * likely to fire when the composer is typed and submitted like a person rather
+ * than filled and clicked in the same millisecond.
+ */
+function humanDelay(min, max) {
+  return Math.round(min + Math.random() * (max - min));
 }
 
 function abortError() {
@@ -45,11 +66,19 @@ async function setPrompt(page, prompt, { signal, session } = {}) {
   }
   checkAbort(signal);
   await field.click({ timeout: 8000 }).catch(() => {});
+  await sleep(humanDelay(180, 380));
   await page.keyboard.press('Control+A').catch(() => {});
   await page.keyboard.press('Backspace').catch(() => {});
+  await sleep(humanDelay(120, 260));
+  const configuredDelay = Number(process.env.VIDMO_FLOW_TYPE_DELAY_MS);
+  const perChar =
+    Number.isFinite(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : humanDelay(14, 26);
   let filled = false;
   try {
-    await field.fill(prompt, { timeout: 15_000 });
+    // Type with real key events instead of an instant DOM fill.
+    await page.keyboard.type(prompt, { delay: perChar, timeout: 120_000 });
     filled = true;
   } catch {
     filled = false;
@@ -58,6 +87,8 @@ async function setPrompt(page, prompt, { signal, session } = {}) {
     await field.click({ timeout: 8000 }).catch(() => {});
     await page.keyboard.insertText(prompt);
   }
+  checkAbort(signal);
+  await sleep(humanDelay(350, 700));
   const actual = await field
     .evaluate((element) => {
       if ('value' in element && typeof element.value === 'string') return element.value;
@@ -451,43 +482,57 @@ async function clickGenerate(page, { signal, session } = {}) {
       { step: 'generate', url: page.url() },
     );
   }
+  await sleep(humanDelay(450, 900));
+  checkAbort(signal);
+  // Snapshot existing failure cards as late as possible so a card left over
+  // from an earlier attempt cannot be mistaken for this generation's result.
+  const failureBaseline = await failureMarkerCounts(page);
   await button.click({ timeout: 10_000 });
+  return failureBaseline;
 }
 
 async function mediaCandidates(page, kind) {
-  return page.evaluate((requestedKind) => {
-    const selector = requestedKind === 'clip' ? 'video' : 'img';
-    return [...document.querySelectorAll(selector)]
-      .map((element) => {
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        const src = element.currentSrc || element.src || element.querySelector('source')?.src || '';
-        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-        const visible =
-          rect.width > 40 &&
-          rect.height > 40 &&
-          style.visibility !== 'hidden' &&
-          style.display !== 'none' &&
-          Number(style.opacity || 1) > 0.05;
-        return {
-          src,
-          key: `${src}|${Math.round(rect.width)}x${Math.round(rect.height)}|${element.getAttribute('poster') ?? ''}`,
-          area: Math.round(area),
-          width: Math.round(rect.width),
-          height: Math.round(rect.height),
-          naturalWidth: element.naturalWidth || element.videoWidth || 0,
-          naturalHeight: element.naturalHeight || element.videoHeight || 0,
-          duration: Number.isFinite(element.duration) ? element.duration : null,
-          readyState: element.readyState ?? null,
-          visible,
-          alt: element.getAttribute('alt') ?? '',
-          poster: element.getAttribute('poster') ?? '',
-        };
-      })
-      .filter((item) => item.visible && item.src && item.area > 20_000)
-      .sort((a, b) => b.area - a.area)
-      .slice(0, 20);
-  }, kind);
+  try {
+    return await withTimeout(
+      page.evaluate((requestedKind) => {
+        const selector = requestedKind === 'clip' ? 'video' : 'img';
+        return [...document.querySelectorAll(selector)]
+          .map((element) => {
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            const src = element.currentSrc || element.src || element.querySelector('source')?.src || '';
+            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+            const visible =
+              rect.width > 40 &&
+              rect.height > 40 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              Number(style.opacity || 1) > 0.05;
+            return {
+              src,
+              key: `${src}|${Math.round(rect.width)}x${Math.round(rect.height)}|${element.getAttribute('poster') ?? ''}`,
+              area: Math.round(area),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+              naturalWidth: element.naturalWidth || element.videoWidth || 0,
+              naturalHeight: element.naturalHeight || element.videoHeight || 0,
+              duration: Number.isFinite(element.duration) ? element.duration : null,
+              readyState: element.readyState ?? null,
+              visible,
+              alt: element.getAttribute('alt') ?? '',
+              poster: element.getAttribute('poster') ?? '',
+            };
+          })
+          .filter((item) => item.visible && item.src && item.area > 20_000)
+          .sort((a, b) => b.area - a.area)
+          .slice(0, 20);
+      }, kind),
+      5000,
+      'Flow media scan timed out',
+    );
+  } catch {
+    return [];
+  }
 }
 
 async function mediaSignature(page, kind) {
@@ -504,7 +549,32 @@ async function isLoading(page) {
   return /generating|creating|rendering|processing|queued/i.test(text) || /true/i.test(await busy.getAttribute('aria-busy').catch(() => ''));
 }
 
-async function waitForResult(page, kind, before, { signal, session, onProgress } = {}) {
+async function raiseFlowFailure({ session, kind, failureText, pageText }) {
+  const classified = detectBlockingText(failureText);
+  const message =
+    classified?.kind === 'failure'
+      ? classified.message
+      : 'Flow reported this generation as failed. Check the Flow window, then retry this stage.';
+  const code = classified?.code ?? 'flow_generation_failed';
+  await diagnostics(session, `${kind}-failure`);
+  throw new FlowAutomationError(
+    message,
+    {
+      step: 'generation',
+      kind,
+      failureCode: code,
+      flowText: String(pageText ?? '').slice(0, 1200),
+    },
+    { code },
+  );
+}
+
+async function waitForResult(
+  page,
+  kind,
+  before,
+  { signal, session, onProgress, failureBaseline = {} } = {},
+) {
   const selectors = await loadSelectors();
   const timeout = kind === 'clip' ? VIDEO_TIMEOUT_MS : IMAGE_TIMEOUT_MS;
   const started = Date.now();
@@ -512,35 +582,28 @@ async function waitForResult(page, kind, before, { signal, session, onProgress }
   let stableSince = 0;
   let failureHits = 0;
   let sawResult = false;
+  // Flow keeps a bounded grid of failed cards. If the page was already full of
+  // them, a new anti-abuse card can replace an old one and the multiset diff
+  // above sees no change. The notice is still unambiguous, so stop after a
+  // short grace window instead of waiting out the full media timeout.
+  const abuseGraceMs = Math.max(
+    0,
+    Number(process.env.VIDMO_FLOW_ABUSE_GRACE_MS) ||
+      (kind === 'clip' ? 120_000 : 60_000),
+  );
+  let abuseSince = 0;
 
   while (Date.now() - started < timeout) {
     checkAbort(signal);
     const elapsed = Math.round((Date.now() - started) / 1000);
-    const text = await visibleText(page, 5000);
-    const blocked = detectBlockingText(text);
-    if (blocked) {
-      if (blocked.kind === 'failure') {
-        failureHits += 1;
-        if (failureHits >= 3) {
-          await diagnostics(session, `${kind}-failure`);
-          throw new FlowAutomationError(blocked.message, {
-            step: 'generation',
-            kind,
-            flowText: text.slice(0, 1200),
-          });
-        }
-      } else {
-        failureHits = 0;
-        await session.waitForManual(blocked.message, { signal, onWait: onProgress });
-        continue;
-      }
-    } else {
-      failureHits = 0;
-    }
 
+    // A fresh media element is stronger evidence than page text: Flow keeps
+    // failed cards from earlier attempts on the same project page. Check media
+    // first so a new image/clip is not discarded because of stale failure copy.
     const candidates = await mediaCandidates(page, kind);
     const fresh = candidates.find((item) => !before.has(item.key));
     if (fresh) {
+      failureHits = 0;
       sawResult = true;
       if (fresh.key !== stableKey) {
         stableKey = fresh.key;
@@ -563,10 +626,69 @@ async function waitForResult(page, kind, before, { signal, session, onProgress }
       }
     }
 
+    // Captchas, credits, sign-in and terms must still pause the job. Failure
+    // text is handled separately below because old failed cards stay in the DOM.
+    const text = await visibleText(page, 5000);
+    const blocked = detectBlockingText(text);
+    if (blocked && blocked.kind !== 'failure') {
+      failureHits = 0;
+      await session.waitForManual(blocked.message, { signal, onWait: onProgress });
+      continue;
+    }
+
+    if (blocked?.code === 'flow_abuse') {
+      if (!abuseSince) {
+        abuseSince = Date.now();
+        onProgress?.('Flow is showing an anti-abuse notice; confirming the block…');
+      }
+      if (Date.now() - abuseSince >= abuseGraceMs) {
+        await raiseFlowFailure({ session, kind, failureText: text, pageText: text });
+      }
+    } else {
+      abuseSince = 0;
+    }
+
+    const newFailures = diffFailureCounts(
+      await failureMarkerCounts(page),
+      failureBaseline,
+    );
+    if (newFailures.length > 0) {
+      failureHits += 1;
+      if (failureHits === 1) {
+        onProgress?.('Flow reported a problem; confirming it belongs to this generation…');
+      }
+      if (failureHits >= 3) {
+        await raiseFlowFailure({
+          session,
+          kind,
+          failureText: newFailures[0],
+          pageText: text,
+        });
+      }
+    } else {
+      failureHits = 0;
+    }
+
     onProgress?.(
       `Flow is generating stage ${kind === 'clip' ? 'video' : 'image'}… ${elapsed}s`,
     );
-    await sleep(2500);
+    await sleep(POLL_MS);
+  }
+
+  // Flow can take the entire timeout before rendering its failure cards, for
+  // example while the request is queued. Check once more so a late anti-abuse
+  // block is classified as a block instead of an ambiguous timeout.
+  const lateFailures = diffFailureCounts(
+    await failureMarkerCounts(page),
+    failureBaseline,
+  );
+  if (lateFailures.length > 0) {
+    await raiseFlowFailure({
+      session,
+      kind,
+      failureText: lateFailures[0],
+      pageText: await visibleText(page, 5000),
+    });
   }
 
   await diagnostics(session, `${kind}-timeout`);
@@ -695,8 +817,13 @@ export async function generateImage({
     const length = await setPrompt(page, prompt, { signal, session });
     const before = await mediaSignature(page, 'image');
     onProgress?.('Sending the image to Google Flow…');
-    await clickGenerate(page, { signal, session });
-    const candidate = await waitForResult(page, 'image', before, { signal, session, onProgress });
+    const failureBaseline = await clickGenerate(page, { signal, session });
+    const candidate = await waitForResult(page, 'image', before, {
+      signal,
+      session,
+      onProgress,
+      failureBaseline,
+    });
     const media = await captureCandidate(page, candidate, 'image', { session });
     return {
       ...media,
@@ -736,8 +863,13 @@ export async function generateVideo({
     const length = await setPrompt(page, prompt, { signal, session });
     const before = await mediaSignature(page, 'clip');
     onProgress?.('Sending the shot to Flow video generation…');
-    await clickGenerate(page, { signal, session });
-    const candidate = await waitForResult(page, 'clip', before, { signal, session, onProgress });
+    const failureBaseline = await clickGenerate(page, { signal, session });
+    const candidate = await waitForResult(page, 'clip', before, {
+      signal,
+      session,
+      onProgress,
+      failureBaseline,
+    });
     const media = await captureCandidate(page, candidate, 'clip', { session });
     return {
       ...media,

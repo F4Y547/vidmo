@@ -171,13 +171,15 @@ export const BLOCKING_PATTERNS = [
   },
   {
     kind: 'failure',
+    code: 'flow_abuse',
     pattern:
       /unusual activity|automated queries|browser extensions that modify the page/i,
     message:
-      'Flow blocked this generation as unusual activity (its page mentions extensions or automation). Close browser extensions in the Flow window, then retry.',
+      'Google Flow blocked this generation for unusual activity. Google makes this decision for the signed-in account and network, not VidMo, and VidMo already launches Flow with browser extensions disabled. Retrying now can extend the block. Wait several hours (or until tomorrow), avoid VPNs and proxies, and use a personal Google account that has used Flow normally. Details: https://support.google.com/flow',
   },
   {
     kind: 'failure',
+    code: 'flow_generation_failed',
     pattern:
       /something went wrong|generation failed|failed to generate|try again later|request failed|content policy/i,
     message: 'Flow reported a generation error. Check the Flow window, then resume or reroll.',
@@ -218,9 +220,66 @@ export async function loadSelectors({ refresh = false } = {}) {
 export function detectBlockingText(text) {
   const body = String(text ?? '');
   for (const item of BLOCKING_PATTERNS) {
-    if (item.pattern.test(body)) return { kind: item.kind, message: item.message };
+    if (item.pattern.test(body)) return { kind: item.kind, code: item.code ?? null, message: item.message };
   }
   return null;
+}
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Snapshot Flow's failure notices as a multiset of their text nodes. Flow keeps
+ * failed cards from earlier attempts on the same project page, so the full body
+ * text is not evidence that the *current* generation failed. Comparing counts
+ * before and after clicking Generate isolates newly added notices.
+ */
+export async function failureMarkerCounts(page) {
+  const patterns = BLOCKING_PATTERNS.filter((item) => item.kind === 'failure').map(
+    ({ pattern }) => ({ source: pattern.source, flags: pattern.flags }),
+  );
+  if (!patterns.length) return {};
+  try {
+    return await withTimeout(
+      page.evaluate((list) => {
+        const regexes = list.map((item) => new RegExp(item.source, item.flags));
+        const counts = {};
+        if (!document.body) return counts;
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+          const value = String(walker.currentNode.nodeValue ?? '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (!value) continue;
+          if (!regexes.some((regex) => regex.test(value))) continue;
+          counts[value] = (counts[value] ?? 0) + 1;
+        }
+        return counts;
+      }, patterns),
+      5000,
+      'Flow failure scan timed out',
+    );
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Return the failure texts that appear more often now than in the baseline.
+ * Identical messages from older cards are subtracted, so six stale anti-abuse
+ * cards do not hide one genuinely new card.
+ */
+export function diffFailureCounts(current, baseline) {
+  const previous = baseline && typeof baseline === 'object' ? baseline : {};
+  return Object.entries(current ?? {})
+    .filter(([text, count]) => Number(count) > Number(previous[text] ?? 0))
+    .map(([text]) => text);
 }
 
 export async function findFirst(page, selectors, { timeout = 1200, visible = true } = {}) {

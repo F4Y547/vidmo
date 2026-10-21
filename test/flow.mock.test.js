@@ -13,6 +13,9 @@ process.env.VIDMO_DATA_DIR = path.join(
 );
 process.env.VIDMO_FLOW_IMAGE_TIMEOUT_MS = '20000';
 process.env.VIDMO_FLOW_VIDEO_TIMEOUT_MS = '20000';
+process.env.VIDMO_FLOW_TYPE_DELAY_MS = '0';
+process.env.VIDMO_FLOW_POLL_MS = '100';
+process.env.VIDMO_FLOW_ABUSE_GRACE_MS = '1200';
 delete process.env.VIDMO_FLOW_IMAGE_MODEL;
 delete process.env.VIDMO_FLOW_VIDEO_MODEL;
 
@@ -33,7 +36,13 @@ const VIDEO_DATA_URL = `data:video/mp4;base64,${VIDEO_BYTES.toString('base64')}`
  * model switcher with Image/Video menu options, a 9:16 button, a hidden
  * start-frame file input and a Generate button that appends a media element.
  */
-function mockFlowHtml(mode) {
+const ABUSE_TEXT =
+  'We noticed some unusual activity. Note that browser extensions that modify the page may cause issues. Please visit the Help Centre for more information. You have not been charged for this generation.';
+
+function mockFlowHtml(
+  mode,
+  { existingFailures = 0, failOnGenerate = false, maxFailures = Infinity } = {},
+) {
   return `<!doctype html>
 <html lang="en">
   <head><meta charset="utf-8" /><title>Mock Flow</title></head>
@@ -53,6 +62,31 @@ function mockFlowHtml(mode) {
       const MODE = ${JSON.stringify(mode)};
       const IMAGE = ${JSON.stringify(IMAGE_DATA_URL)};
       const VIDEO = ${JSON.stringify(VIDEO_DATA_URL)};
+      const ABUSE = ${JSON.stringify(ABUSE_TEXT)};
+      const EXISTING_FAILURES = ${Number(existingFailures)};
+      const FAIL_ON_GENERATE = ${Boolean(failOnGenerate)};
+      const MAX_FAILURES = ${Number.isFinite(maxFailures) ? Number(maxFailures) : 'Infinity'};
+      const results = document.getElementById('results');
+
+      function addFailureCard() {
+        // A full grid drops its oldest card, so the DOM count stays the same
+        // even though a new generation just failed.
+        if (results.querySelectorAll('section').length >= MAX_FAILURES) {
+          results.querySelector('section')?.remove();
+        }
+        const card = document.createElement('section');
+        const status = document.createElement('span');
+        status.textContent = 'Failed';
+        const detail = document.createElement('span');
+        detail.textContent = ABUSE;
+        const retry = document.createElement('button');
+        retry.textContent = 'Retry';
+        card.append(status, detail, retry);
+        results.appendChild(card);
+      }
+
+      for (let index = 0; index < EXISTING_FAILURES; index += 1) addFailureCard();
+
       const model = document.getElementById('model');
       const menu = document.getElementById('menu');
       model.addEventListener('click', () => { menu.hidden = false; });
@@ -63,7 +97,10 @@ function mockFlowHtml(mode) {
         });
       });
       document.getElementById('generate').addEventListener('click', () => {
-        const results = document.getElementById('results');
+        if (FAIL_ON_GENERATE) {
+          addFailureCard();
+          return;
+        }
         if (MODE === 'image') {
           const img = document.createElement('img');
           img.src = IMAGE;
@@ -233,6 +270,119 @@ test('mock Flow: generateImage writes the prompt and returns the new image bytes
 
   const promptValue = await page.inputValue('#prompt');
   assert.match(promptValue, /Extreme macro cinematic shot/);
+});
+
+test('mock Flow: stale failure cards do not fail a new successful image', async (t) => {
+  const { server, base } = await startMockServer(
+    'image',
+    mockFlowHtml('image', { existingFailures: 4 }),
+  );
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const browser = await launchBrowser(t);
+  if (!browser) {
+    t.skip('Chrome/Edge or playwright-core not available; mock Flow test skipped.');
+    return;
+  }
+
+  const page = await browser.newPage();
+  t.after(() => page.close().catch(() => {}));
+  await page.goto(base, { waitUntil: 'domcontentloaded' });
+
+  const result = await generateImage({
+    session: mockSession(page),
+    prompt:
+      'Extreme macro cinematic shot of a tiny samosa on a miniature brass plate, giant hands nearby, 1:12 scale, shallow depth of field.',
+    projectId: 'mock-project-stale-failure',
+    projectTitle: 'Mock project',
+    stageLabel: 'S2',
+  });
+
+  assert.equal(result.mimeType, 'image/png');
+  assert.ok(result.buffer.equals(PNG_BYTES), 'the new image should still be captured');
+  assert.equal(
+    await page.locator('#results section').count(),
+    4,
+    'the stale failure cards should be left untouched',
+  );
+});
+
+test('mock Flow: a newly added anti-abuse card fails with the flow_abuse code', async (t) => {
+  const { server, base } = await startMockServer(
+    'image',
+    mockFlowHtml('image', { existingFailures: 2, failOnGenerate: true }),
+  );
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const browser = await launchBrowser(t);
+  if (!browser) {
+    t.skip('Chrome/Edge or playwright-core not available; mock Flow test skipped.');
+    return;
+  }
+
+  const page = await browser.newPage();
+  t.after(() => page.close().catch(() => {}));
+  await page.goto(base, { waitUntil: 'domcontentloaded' });
+
+  await assert.rejects(
+    generateImage({
+      session: mockSession(page),
+      prompt:
+        'Extreme macro cinematic shot of a tiny samosa on a miniature brass plate, giant hands nearby, 1:12 scale, shallow depth of field.',
+      projectId: 'mock-project-new-failure',
+      projectTitle: 'Mock project',
+      stageLabel: 'S3',
+    }),
+    (error) => {
+      assert.equal(error.code, 'flow_abuse');
+      assert.match(error.message, /account and network/);
+      assert.equal(error.details.failureCode, 'flow_abuse');
+      return true;
+    },
+  );
+});
+
+test('mock Flow: a capped failure grid cannot hide a new anti-abuse block', async (t) => {
+  const { server, base } = await startMockServer(
+    'image',
+    mockFlowHtml('image', {
+      existingFailures: 2,
+      failOnGenerate: true,
+      maxFailures: 2,
+    }),
+  );
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const browser = await launchBrowser(t);
+  if (!browser) {
+    t.skip('Chrome/Edge or playwright-core not available; mock Flow test skipped.');
+    return;
+  }
+
+  const page = await browser.newPage();
+  t.after(() => page.close().catch(() => {}));
+  await page.goto(base, { waitUntil: 'domcontentloaded' });
+
+  const started = Date.now();
+  await assert.rejects(
+    generateImage({
+      session: mockSession(page),
+      prompt:
+        'Extreme macro cinematic shot of a tiny samosa on a miniature brass plate, giant hands nearby, 1:12 scale, shallow depth of field.',
+      projectId: 'mock-project-capped-failure',
+      projectTitle: 'Mock project',
+      stageLabel: 'S4',
+    }),
+    (error) => {
+      assert.equal(error.code, 'flow_abuse');
+      assert.equal(error.details.failureCode, 'flow_abuse');
+      return true;
+    },
+  );
+  assert.ok(
+    Date.now() - started < 10_000,
+    'the capped failure grid should still fail fast',
+  );
 });
 
 test('mock Flow 2026: image mode selects 9:16, x1, and the Start generation button', async (t) => {

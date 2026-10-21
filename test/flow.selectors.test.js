@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { detectBlockingText } from '../src/server/flow/selectors.js';
+import { detectBlockingText, diffFailureCounts } from '../src/server/flow/selectors.js';
 
 // Regression guard for the Flow account menu: it renders the standard
 // "This site is protected by reCAPTCHA..." footer. That is not a challenge and
@@ -22,15 +22,30 @@ test('real Google challenges still pause Flow', () => {
 });
 
 test('Flow failures and credit/sign-in states are classified', () => {
-  assert.equal(
-    detectBlockingText(
-      'We noticed some unusual activity. Browser extensions that modify the page may cause issues.',
-    ).kind,
-    'failure',
+  const abuse = detectBlockingText(
+    'We noticed some unusual activity. Browser extensions that modify the page may cause issues.',
   );
+  assert.equal(abuse.kind, 'failure');
+  assert.equal(abuse.code, 'flow_abuse');
+  assert.match(abuse.message, /account and network/);
+  assert.match(abuse.message, /extensions disabled/);
   assert.equal(detectBlockingText('You do not have enough credits for this generation.').kind, 'credits');
   assert.equal(detectBlockingText('Sign in to continue with Google Flow.').kind, 'signin');
-  assert.equal(detectBlockingText('Something went wrong. Generation failed.').kind, 'failure');
+  const generic = detectBlockingText('Something went wrong. Generation failed.');
+  assert.equal(generic.kind, 'failure');
+  assert.equal(generic.code, 'flow_generation_failed');
+});
+
+test('failure markers only count when their text appears more often than the baseline', () => {
+  const stale = 'We noticed some unusual activity. Browser extensions that modify the page may cause issues.';
+  const generic = 'Something went wrong. Generation failed.';
+  const baseline = { [stale]: 6, [generic]: 1 };
+  assert.deepEqual(diffFailureCounts(baseline, baseline), []);
+  assert.deepEqual(
+    diffFailureCounts({ ...baseline, [stale]: 7 }, baseline),
+    [stale],
+  );
+  assert.deepEqual(diffFailureCounts({ [stale]: 6 }, {}), [stale]);
 });
 
 test('normal studio copy does not trip the detectors', () => {
